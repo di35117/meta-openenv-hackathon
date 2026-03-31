@@ -1,0 +1,10 @@
+name: "asha-rural-health"
+version: "1.0.0"
+description: "ASHA Worker resource allocation and patient prioritization in rural India."
+tasks:
+  - id: "task1"
+    difficulty: "easy"
+  - id: "task2"
+    difficulty: "medium"
+  - id: "task3"
+    difficulty: "hard"
