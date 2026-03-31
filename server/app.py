@@ -1,5 +1,5 @@
 import uvicorn
-from openenv.core.env_server.app import create_app
+from openenv.core.env_server import create_app  # <-- THE FIX IS HERE
 from .my_env_environment import MyEnvironment
 
 try:
