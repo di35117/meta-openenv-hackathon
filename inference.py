@@ -68,6 +68,7 @@ DECISION RULES:
   3. Skip households with road_quality < 0.12 during heavy_rain (unreachable)
   4. Group households in the same geo_cluster to save travel time
   5. If est_visit_duration_min + travel is large -> place it later in the day
+  6. On heavy_rain days — still visit the closest high-priority households even if slow
 
 RESPONSE FORMAT — return ONLY valid JSON, nothing else:
 {"visit_sequence": [id1, id2, id3, ...]}
@@ -105,6 +106,8 @@ def greedy_sequence(obs: dict) -> List[int]:
         "routine":        0.5,
     }
 
+    HIGH_PRIORITY = {"newborn", "tb_patient", "high_risk_preg"}
+
     def estimate_travel_min(h: dict) -> float:
         rq    = max(0.05, h.get("road_quality", 0.5))
         dist  = h.get("dist_from_asha_home_km", 1.0)
@@ -127,9 +130,37 @@ def greedy_sequence(obs: dict) -> List[int]:
     ranked   = sorted(households, key=score, reverse=True)
     selected = []
     elapsed  = 0.0
+
+    # FIX: On heavy rain days, guarantee at least 3 closest high-priority
+    # households are included regardless of time budget constraints.
+    # This prevents the agent from doing 0 visits on bad weather days.
+    guaranteed = []
+    if weather == "heavy_rain":
+        high_pri = [
+            h for h in households
+            if h.get("category") in HIGH_PRIORITY or h.get("danger_sign_active")
+        ]
+        # Sort by distance — closest first
+        high_pri_sorted = sorted(
+            high_pri, key=lambda h: h.get("dist_from_asha_home_km", 999)
+        )
+        guaranteed = [h["id"] for h in high_pri_sorted[:3]]
+
+    # Add guaranteed visits first
+    for hid in guaranteed:
+        h = next((x for x in households if x["id"] == hid), None)
+        if h:
+            t_travel = estimate_travel_min(h)
+            t_visit  = h.get("est_visit_duration_min", 25)
+            selected.append(hid)
+            elapsed += t_travel + t_visit
+
+    # Fill remaining slots with normal greedy selection
     for h in ranked:
         if len(selected) >= 15:
             break
+        if h["id"] in selected:
+            continue
         t_travel = estimate_travel_min(h)
         t_visit  = h.get("est_visit_duration_min", 25)
         if elapsed + t_travel + t_visit > time_left:
@@ -200,6 +231,7 @@ def build_prompt(obs: dict, task_id: str, step_num: int) -> str:
         f"{chr(10).join(rows)}\n\n"
         f"You have {time_remaining} minutes left today.\n"
         f"Plan a route that fits in this time. Group clusters to reduce travel.\n"
+        f"On heavy_rain days, still visit the closest high-priority households.\n"
         f'Return ONLY JSON: {{"visit_sequence": [id1, id2, ...]}}'
     )
 
@@ -264,10 +296,13 @@ def run_episode(task_id: str) -> dict:
 
         visit_seq = action_obj.get("visit_sequence", [])
 
-        # Step — action wrapped correctly for openenv-core
-        step_raw = env_post("/step", json={"action": {"visit_sequence": visit_seq}})
+        # Step — include task_id so server routes to correct env instance
+        step_raw = env_post("/step", json={
+            "action":  {"visit_sequence": visit_seq},
+            "task_id": task_id,
+        })
 
-        # KEY FIX: read done/reward from TOP-LEVEL response only
+        # Read done/reward from top-level response only
         reward = step_raw.get("reward", 0.0)
         done   = step_raw.get("done",   False)
 
@@ -294,7 +329,7 @@ def run_episode(task_id: str) -> dict:
     # Grade
     score = 0.0
     try:
-        grade = env_get("/grade")
+        grade = env_get(f"/grade?task_id={task_id}")
         score = grade.get("score", 0.0)
     except Exception:
         score = round(max(0.0, min(1.0, total_reward / max(step_num + 1, 1))), 4)
@@ -302,7 +337,7 @@ def run_episode(task_id: str) -> dict:
     # Extra metrics from state
     env_state = {}
     try:
-        env_state = env_get("/state")
+        env_state = env_get(f"/state?task_id={task_id}")
     except Exception:
         pass
 
