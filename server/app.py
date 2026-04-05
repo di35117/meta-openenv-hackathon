@@ -10,22 +10,30 @@ except ImportError:
 
 app = FastAPI(title="ASHA Village Health OpenEnv")
 
-# Single environment instance — no session routing complexity
-_env = MyEnvironment()
+# One isolated environment per task_id
+_envs = {}
+
+def get_env(task_id: str) -> MyEnvironment:
+    if task_id not in _envs:
+        _envs[task_id] = MyEnvironment()
+    return _envs[task_id]
 
 
 @app.post("/reset")
 def reset(body: dict = {}):
     task_id = body.get("task_id", "task1")
-    obs = _env.reset(task_id=task_id)
+    env = get_env(task_id)
+    obs = env.reset(task_id=task_id)
     return {"observation": obs.model_dump(), "reward": 0.0, "done": False}
 
 
 @app.post("/step")
 def step(body: dict):
     action_data = body.get("action", body)
+    task_id = body.get("task_id", "task1")
+    env = get_env(task_id)
     action = Action(**action_data)
-    obs = _env.step(action)
+    obs = env.step(action)
     return {
         "observation": obs.model_dump(),
         "reward":      obs.reward,
@@ -34,18 +42,16 @@ def step(body: dict):
 
 
 @app.get("/state")
-def state():
-    return _env.get_full_state()
+def state(task_id: str = "task1"):
+    return get_env(task_id).get_full_state()
 
 
 @app.get("/grade")
-def grade():
-    state_data = _env.get_full_state()
-    score = run_grader(state_data.get("task_id", "task1"), state_data)
-    return {
-        "score":   score,
-        "task_id": state_data.get("task_id", "task1"),
-    }
+def grade(task_id: str = "task1"):
+    env = get_env(task_id)
+    state_data = env.get_full_state()
+    score = run_grader(task_id, state_data)
+    return {"score": score, "task_id": task_id}
 
 
 @app.get("/health")
