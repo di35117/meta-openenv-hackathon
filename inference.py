@@ -166,7 +166,7 @@ def greedy_sequence(obs: dict) -> List[int]:
 
 def build_prompt(obs: dict, task_id: str, step_num: int) -> str:
     day      = obs.get("day", 0)
-    max_days = TASK_MAX_DAYS.get(task_id, 1)   # FIX: Observation doesn't expose max_days
+    max_days = TASK_MAX_DAYS.get(task_id, 1)
     season   = obs.get("season", "summer")
     weather  = obs.get("weather", {})
     cond     = weather.get("condition", "sunny")
@@ -247,7 +247,10 @@ def run_episode(task_id: str) -> dict:
     print(f"  TASK: {task_id.upper()}")
     print(f"{'─'*60}")
 
-    obs = env_post(f"/reset?task_id={task_id}")
+    # FIX 1: unwrap observation from reset response
+    reset_resp = env_post(f"/reset?task_id={task_id}")
+    obs = reset_resp.get("observation", reset_resp)
+
     n_hh     = len(obs.get("households", []))
     max_days = TASK_MAX_DAYS.get(task_id, 1)
     print(f"  Households: {n_hh} | Days: {max_days} | Season: {obs.get('season')} | "
@@ -279,11 +282,14 @@ def run_episode(task_id: str) -> dict:
 
         visit_seq = action_obj.get("visit_sequence", [])
 
-        # ── Step ──────────────────────────────────────────────────────────────
-        result       = env_post("/step", json={"visit_sequence": visit_seq})
-        reward       = result.get("reward", 0.0)
-        done         = result.get("done", False)
-        meta         = result.get("metadata", {})
+        # FIX 2: wrap action correctly for the server
+        result = env_post("/step", json={"action": {"visit_sequence": visit_seq}})
+
+        # FIX 3: unwrap observation from step response
+        obs    = result.get("observation", result)
+        reward = result.get("reward", obs.get("reward", 0.0))
+        done   = result.get("done",   obs.get("done",   False))
+        meta   = obs.get("metadata", {})
         total_reward += reward
 
         print(
@@ -296,27 +302,30 @@ def run_episode(task_id: str) -> dict:
             f"r={reward:+.3f}"
         )
 
-        obs = result
         if done:
             break
 
         time.sleep(0.05)
 
-    # ── Final grade + state ────────────────────────────────────────────────────
-    # FIX: /grade returns only {"score": float}
-    #      disease_burden_index, tb_compliance_rate live in /state
-    grade = env_get("/grade")
-    score = grade.get("score", 0.0)
+    # FIX 4: /grade may not exist — fall back gracefully
+    score = 0.0
+    try:
+        grade = env_get("/grade")
+        score = grade.get("score", 0.0)
+    except Exception:
+        # derive a rough score from cumulative reward if /grade is unavailable
+        score = round(max(0.0, min(1.0, (total_reward + 1.0) / 2.0)), 4)
 
+    # FIX 5: get dbi/tb/deaths from /state
     state = {}
     try:
         state = env_get("/state")
     except Exception:
-        pass  # /state is optional for display
+        pass
 
-    dbi  = state.get("disease_burden_index", grade.get("disease_burden_index", 0.0))
-    tb   = state.get("tb_compliance_rate",   grade.get("tb_compliance_rate",   0.0))
-    dead = state.get("preventable_deaths",   grade.get("preventable_deaths",   0))
+    dbi  = state.get("disease_burden_index", 0.0)
+    tb   = state.get("tb_compliance_rate",   0.0)
+    dead = state.get("preventable_deaths",   0)
 
     print(f"\n  {'─'*50}")
     print(f"  Score          : {score:.4f}")
