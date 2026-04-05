@@ -1,0 +1,8 @@
+openenv-core[core] @ git+https://github.com/meta-pytorch/OpenEnv.git
+fastapi>=0.115.0
+uvicorn>=0.24.0
+pydantic
+
+[dev]
+pytest>=8.0.0
+pytest-cov>=4.0.0
