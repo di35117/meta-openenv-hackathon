@@ -248,7 +248,7 @@ def run_episode(task_id: str) -> dict:
     print(f"{'─'*60}")
 
     # FIX 1: unwrap observation from reset response
-    reset_resp = env_post(f"/reset?task_id={task_id}")
+    reset_resp = env_post("/reset", json={"task_id": task_id})
     obs = reset_resp.get("observation", reset_resp)
 
     n_hh     = len(obs.get("households", []))
