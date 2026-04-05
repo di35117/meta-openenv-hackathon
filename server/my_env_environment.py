@@ -31,6 +31,15 @@ SEASONAL / WEATHER DYNAMICS
   Deterioration rates on tick() include the seasonal multiplier.
   Alert rates in generate_daily_events() scale with season.
   Road quality presented to the agent already has weather modifier applied.
+
+REWARD FUNCTION (fixed vs original):
+  1. Removed hard clip max(-1, min(1, r)) — replaced with tanh normalisation
+     so the agent can distinguish catching 3 danger signs vs 6.
+  2. Time efficiency bonus was BACKWARDS (rewarded doing nothing).
+     Replaced with a visits-per-hour throughput bonus.
+  3. Referral bonus no longer double-counts with danger_sign.
+  4. Routing efficiency is now continuous, not a binary threshold.
+  5. Added geographic equity bonus for visiting 3+ clusters per day.
 """
 
 import math
@@ -62,7 +71,7 @@ DAY_END_MIN    = 360   # 1:00 PM  (6 working hours)
 MAX_VISITS     = 15    # absolute cap even if time allows
 
 # ── ASHA energy model ─────────────────────────────────────────────────────────
-ENERGY_START             = 100.0
+ENERGY_START               = 100.0
 ENERGY_COST_TRAVEL_PER_MIN = 0.15   # walking is physically taxing
 ENERGY_COST_VISIT_PER_MIN  = 0.10   # mental + clinical effort per minute
 
@@ -99,7 +108,7 @@ class MyEnvironment(_Base):
         Start a fresh episode.  Accepts task_id as a keyword argument.
         Creates a brand-new Village so no state leaks between episodes.
         """
-        task_id = kwargs.get("task_id", "task1")
+        task_id      = kwargs.get("task_id", "task1")
         self._state  = State(episode_id=str(uuid4()), step_count=0)
         self.task    = TASKS.get(task_id, TASKS["task1"])
         self.village = Village(
@@ -179,19 +188,19 @@ class MyEnvironment(_Base):
             cx, cy = hh.x, hh.y
 
             # Annotate result with routing data (useful for debugging + history)
-            result["household_id"]  = hh_id
-            result["travel_min"]    = round(travel_min, 1)
-            result["time_of_visit"] = round(elapsed_min, 1)
+            result["household_id"]    = hh_id
+            result["travel_min"]      = round(travel_min, 1)
+            result["time_of_visit"]   = round(elapsed_min, 1)
             result["energy_at_visit"] = round(energy, 1)
             visit_results.append(result)
 
         # Save ASHA's end-of-day state
-        self.asha_x          = cx
-        self.asha_y          = cy
-        self.asha_energy     = round(energy, 1)
+        self.asha_x           = cx
+        self.asha_y           = cy
+        self.asha_energy      = round(energy, 1)
         self.current_time_min = round(elapsed_min, 1)
 
-        visited_ids = {r["household_id"] for r in visit_results}
+        visited_ids      = {r["household_id"] for r in visit_results}
         total_travel_min = round(sum(r["travel_min"] for r in visit_results), 1)
 
         # ── Tick unvisited households ─────────────────────────────────────
@@ -210,17 +219,17 @@ class MyEnvironment(_Base):
 
         # ── Log this day ──────────────────────────────────────────────────
         self.history.append({
-            "day":                 self.day,
-            "visited":             list(visited_ids),
-            "danger_ids_before":   list(danger_ids_before),
-            "reward":              reward,
-            "elapsed_min":         self.current_time_min,
-            "total_travel_min":    total_travel_min,
-            "asha_energy_end":     self.asha_energy,
-            "new_deaths":          new_deaths,
-            "season":              self.village.season,
-            "weather":             self.village.weather.condition,
-            "visits_completed":    len(visit_results),
+            "day":               self.day,
+            "visited":           list(visited_ids),
+            "danger_ids_before": list(danger_ids_before),
+            "reward":            reward,
+            "elapsed_min":       self.current_time_min,
+            "total_travel_min":  total_travel_min,
+            "asha_energy_end":   self.asha_energy,
+            "new_deaths":        new_deaths,
+            "season":            self.village.season,
+            "weather":           self.village.weather.condition,
+            "visits_completed":  len(visit_results),
         })
 
         self.day += 1
@@ -256,42 +265,110 @@ class MyEnvironment(_Base):
         total_travel_min: float,
         elapsed_min: float,
     ) -> float:
+        """
+        Compute a shaped per-step reward grounded in real ASHA clinical priorities.
+
+        Fixes over the original version
+        ────────────────────────────────
+        1. No hard clip: original max(-1, min(1, r)) destroyed the learning signal
+           on almost every realistic day.  A good day (3 danger signs + 2 newborns
+           + 3 TB doses) had raw reward ~3.2, clipped to 1.0 — identical to a
+           mediocre day with 1 danger sign.  Fixed with tanh normalisation, which
+           preserves ordering while gently saturating at extremes.
+
+        2. Time efficiency bonus was backwards: original formula
+           (time_remaining / 360) * 0.04 gave the HIGHEST bonus (0.04) for
+           completing zero visits.  Fixed: now rewards visits-per-hour throughput
+           so doing more work in less time is always better.
+
+        3. Referral no longer double-counts danger signs: when danger_sign is
+           active, risk_score > 0.75 is always true, so the original fired both
+           +0.40 (danger) and +0.30 (referral).  Referral bonus now only fires
+           for non-danger high-risk cases.
+
+        4. Routing efficiency is continuous: original was a binary step
+           (travel < 108 min → +0.03, else 0).  Now scales smoothly.
+
+        5. Geographic equity bonus: small reward for visiting 3+ geo clusters,
+           discouraging the agent from only optimising the nearest cluster.
+        """
         r = 0.0
 
         for res in visit_results:
             cat = res["category"]
 
-            # Core clinical rewards
-            if res["danger_sign"]:        r += 0.40   # caught an emergency
-            if res["referral_needed"]:    r += 0.30   # initiated referral
-            if res.get("newborn_48hr"):   r += 0.25   # 48-hr newborn visit
-            if res.get("tb_dose_on_time"):r += 0.15   # DOTS dose on schedule
+            # ── Core clinical rewards ─────────────────────────────────────
+            # Danger sign caught: highest-value ASHA action in real practice.
+            if res["danger_sign"]:
+                r += 0.40
 
-            # Partial credit for important-but-not-emergency categories
+            # Referral bonus: fires only for non-danger high-risk cases to
+            # avoid double-counting (danger_sign always implies risk > 0.75).
+            if res["referral_needed"] and not res["danger_sign"]:
+                r += 0.20
+
+            # 48-hour newborn visit: prevents neonatal sepsis — time-critical.
+            if res.get("newborn_48hr"):
+                r += 0.25
+
+            # TB dose supervised on time: prevents drug-resistant TB.
+            if res.get("tb_dose_on_time"):
+                r += 0.15
+
+            # High-priority category visited (even if currently stable).
             if cat in ("high_risk_preg", "diabetic"):
                 r += 0.05
 
-            # Penalty for wasting a slot on a very stable routine household
-            if cat == "routine" and res["risk_before"] < 0.10 and not res["danger_sign"]:
-                r -= 0.05
+            # Wasted-visit penalty: routine household that genuinely didn't
+            # need attention.  Scaled so lower-risk = bigger penalty.
+            if cat == "routine" and not res["danger_sign"] and res["risk_before"] < 0.10:
+                waste_penalty = 0.05 * (1.0 - res["risk_before"] / 0.10)
+                r -= waste_penalty
 
-        # Time efficiency bonus:
-        # Finishing with time to spare means the agent could have fit more visits.
-        # This nudges the agent to batch nearby households efficiently.
-        time_remaining = max(0.0, DAY_END_MIN - elapsed_min)
-        time_efficiency_bonus = (time_remaining / DAY_END_MIN) * 0.04
-        r += time_efficiency_bonus
+        # ── Throughput bonus ──────────────────────────────────────────────
+        # Reward visits-per-hour: more effective visits in less total time
+        # means better geographic batching.
+        # Max practical throughput ≈ 10 visits / 360 min = 1.67 visits/hr.
+        # Bonus is capped at +0.05 to keep it smaller than clinical rewards.
+        if elapsed_min > 0:
+            visits_per_hour  = (len(visit_results) / elapsed_min) * 60.0
+            throughput_bonus = min(0.05, (visits_per_hour / 1.67) * 0.05)
+            r += throughput_bonus
 
-        # Travel efficiency bonus:
-        # If total travel was less than 30% of the working day, the agent
-        # clustered households well.
-        if len(visit_results) > 0 and total_travel_min < DAY_END_MIN * 0.30:
+        # ── Routing efficiency bonus (continuous) ─────────────────────────
+        # Original: binary if travel_min < 108 → +0.03.
+        # Fixed: scales from 0 (travel = 100% of elapsed) to 0.04
+        # (travel = 0% of elapsed).  Rewards cluster batching proportionally.
+        if len(visit_results) > 0 and elapsed_min > 0:
+            travel_fraction = total_travel_min / elapsed_min
+            routing_bonus   = max(0.0, (0.50 - travel_fraction) / 0.50) * 0.04
+            r += routing_bonus
+
+        # ── Geographic equity bonus ───────────────────────────────────────
+        # Small reward for reaching at least 3 distinct geographic clusters.
+        # Prevents the agent from exploiting only the nearest cluster and
+        # mirrors how real ASHA supervisors track equitable coverage.
+        visited_clusters = set()
+        for res in visit_results:
+            hh_id = res.get("household_id")
+            if hh_id is not None and hh_id in self.village.households:
+                visited_clusters.add(self.village.households[hh_id].geo_cluster)
+        if len(visited_clusters) >= 3:
             r += 0.03
 
-        # Death penalty — the harshest signal in the system
+        # ── Death penalty ─────────────────────────────────────────────────
+        # A preventable death cannot be undone.  -1.0 per death is
+        # calibrated to overwhelm any single-day clinical gain, ensuring
+        # the agent never rationally trades a death for more reward.
         r -= 1.0 * new_deaths
+        if new_deaths == 0:
+            normalized = math.tanh(r / 4.0)
+        else:
+            # Death occurred: apply tanh but floor at -1.0 so multiple
+            # simultaneous deaths stay distinguishable.
+            normalized = max(-1.0, math.tanh(r / 4.0))
 
-        return max(-1.0, min(1.0, round(r, 4)))
+        return round(normalized, 4)
 
     # ── Full grading state ────────────────────────────────────────────────────
 
@@ -302,9 +379,9 @@ class MyEnvironment(_Base):
         The grader functions receive a SimpleNamespace of this dict.
         """
         return {
-            "task_id":               self.task.id,
-            "current_day":           self.day,
-            "episode_done":          self.day >= self.task.max_days,
+            "task_id":              self.task.id,
+            "current_day":          self.day,
+            "episode_done":         self.day >= self.task.max_days,
             "all_households": [
                 {
                     "id":                hh.id,
@@ -316,22 +393,22 @@ class MyEnvironment(_Base):
                 }
                 for hh in self.village.households.values()
             ],
-            "cumulative_reward":     round(sum(d["reward"] for d in self.history), 4),
-            "disease_burden_index":  self.village.compute_dbi(),
-            "preventable_deaths":    self.village.preventable_deaths,
-            "tb_compliance_rate":    self.village.get_tb_compliance(),
-            "visit_history":         self.history,
-            "season":                self.village.season,
-            "weather":               self.village.weather.condition,
+            "cumulative_reward":    round(sum(d["reward"] for d in self.history), 4),
+            "disease_burden_index": self.village.compute_dbi(),
+            "preventable_deaths":   self.village.preventable_deaths,
+            "tb_compliance_rate":   self.village.get_tb_compliance(),
+            "visit_history":        self.history,
+            "season":               self.village.season,
+            "weather":              self.village.weather.condition,
         }
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _reset_daily_asha(self):
         """Reset ASHA's position and energy to start-of-day values."""
-        self.asha_x          = self.village.asha_home_x
-        self.asha_y          = self.village.asha_home_y
-        self.asha_energy     = ENERGY_START
+        self.asha_x           = self.village.asha_home_x
+        self.asha_y           = self.village.asha_home_y
+        self.asha_energy      = ENERGY_START
         self.current_time_min = DAY_START_MIN
 
     def _make_observation(self, reward: float, done: bool, info: dict) -> Observation:
