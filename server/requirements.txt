@@ -1,4 +1,13 @@
-openenv-core[core]>=0.2.2
+# Core server dependencies
 fastapi>=0.115.0
-uvicorn>=0.24.0
-pydantic
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+
+# OpenEnv framework — install from GitHub (no PyPI release guaranteed)
+openenv-core[core] @ git+https://github.com/meta-pytorch/OpenEnv.git
+
+# Inference script dependency (OpenAI-compatible client)
+openai>=1.0.0
+
+# Requests for inference.py to talk to the local server
+requests>=2.31.0
