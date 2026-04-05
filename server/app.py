@@ -19,6 +19,16 @@ def get_env(task_id: str) -> MyEnvironment:
     return _envs[task_id]
 
 
+@app.get("/")
+def root():
+    return {
+        "environment": "asha-village-health",
+        "version":     "2.0.0",
+        "docs":        "/docs",
+        "endpoints":   ["/reset", "/step", "/state", "/grade", "/health"],
+    }
+
+
 @app.post("/reset")
 def reset(body: dict = {}):
     task_id = body.get("task_id", "task1")
