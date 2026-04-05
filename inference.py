@@ -12,22 +12,6 @@ REQUIRED by hackathon:
       ENV_URL      — environment server (default http://localhost:8000)
   • Produces reproducible scores for all 3 tasks
   • Runs in < 20 minutes total
-
-AGENT STRATEGY:
-  The LLM is prompted with the full dynamic context:
-    • Real coordinates (x, y) and road quality per household
-    • Today's weather and how it affects road accessibility
-    • ASHA's remaining time and energy
-    • Estimated travel + visit time per household
-    • Season-specific disease risk context
-
-  The agent must plan a route that:
-    1. Prioritises danger signs and newborns
-    2. Clusters households geographically to minimise travel
-    3. Respects the 6-hour time budget
-    4. Avoids inaccessible dirt paths in heavy rain
-
-  A deterministic greedy fallback runs if the LLM call fails.
 """
 
 import json
@@ -46,12 +30,11 @@ MODEL_NAME   = os.environ.get("MODEL_NAME",   "gpt-4o-mini")
 HF_TOKEN     = os.environ.get("HF_TOKEN",     os.environ.get("OPENAI_API_KEY", ""))
 ENV_URL      = os.environ.get("ENV_URL",      "http://localhost:8000")
 
-TEMPERATURE     = 0.0   # deterministic outputs
-MAX_TOKENS      = 512   # short JSON response
-MAX_STEPS       = 32    # safety cap per episode
-REQUEST_TIMEOUT = 30    # seconds per env call
+TEMPERATURE     = 0.0
+MAX_TOKENS      = 512
+MAX_STEPS       = 32
+REQUEST_TIMEOUT = 30
 
-# Task day counts — used for display only (Observation doesn't expose max_days)
 TASK_MAX_DAYS = {"task1": 1, "task2": 7, "task3": 30}
 
 client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN or "placeholder")
@@ -67,7 +50,7 @@ SUNITA'S CONSTRAINTS:
 - Maximum 15 visits per day
 - She walks between households (no vehicle)
 
-CATEGORY PRIORITY (highest → lowest):
+CATEGORY PRIORITY (highest to lowest):
   1. newborn         — CRITICAL: must visit within 48hrs of birth (neonatal sepsis risk)
   2. tb_patient      — HIGH: DOTS protocol requires supervised dose every 3 days
   3. high_risk_preg  — HIGH: weekly monitoring (eclampsia, haemorrhage risk)
@@ -75,16 +58,16 @@ CATEGORY PRIORITY (highest → lowest):
   5. routine         — LOWEST: monthly wellness check
 
 TRAVEL TIME FORMULA (approximate):
-  speed_kmh = road_quality × 5.0  (paved=5, gravel=3.5, dirt=2, mud=0.8)
-  If heavy_rain: speed_kmh × 0.4 for dirt paths (road_quality < 0.4)
-  travel_min = (dist_from_asha_home_km / speed_kmh) × 60
+  speed_kmh = road_quality x 5.0  (paved=5, gravel=3.5, dirt=2, mud=0.8)
+  If heavy_rain: speed_kmh x 0.4 for dirt paths (road_quality < 0.4)
+  travel_min = (dist_from_asha_home_km / speed_kmh) x 60
 
 DECISION RULES:
-  1. If danger_sign_active=true → visit FIRST regardless of distance
-  2. If newborn AND days_since_birth ≤ 1 → must visit today
+  1. If danger_sign_active=true -> visit FIRST regardless of distance
+  2. If newborn AND days_since_birth <= 1 -> must visit today
   3. Skip households with road_quality < 0.12 during heavy_rain (unreachable)
   4. Group households in the same geo_cluster to save travel time
-  5. If est_visit_duration_min + travel is large → place it later in the day
+  5. If est_visit_duration_min + travel is large -> place it later in the day
 
 RESPONSE FORMAT — return ONLY valid JSON, nothing else:
 {"visit_sequence": [id1, id2, id3, ...]}
@@ -110,13 +93,6 @@ def env_get(path: str) -> dict:
 # ── Greedy fallback ───────────────────────────────────────────────────────────
 
 def greedy_sequence(obs: dict) -> List[int]:
-    """
-    Deterministic greedy fallback used when the LLM call fails.
-
-    Scores each household by urgency, penalises inaccessible ones,
-    and estimates time fit using the travel + visit duration formula.
-    Returns an ordered list of household IDs.
-    """
     households = obs.get("households", [])
     weather    = obs.get("weather", {}).get("condition", "sunny")
     time_left  = 360 - obs.get("current_time_min", 0)
@@ -139,7 +115,8 @@ def greedy_sequence(obs: dict) -> List[int]:
 
     def score(h: dict) -> float:
         s = h.get("risk_score", 0)
-        if h.get("danger_sign_active"):           s += 1.5
+        if h.get("danger_sign_active"):
+            s += 1.5
         s += CATEGORY_WEIGHT.get(h.get("category", "routine"), 0.5)
         rq = h.get("road_quality", 0.5)
         if weather == "heavy_rain" and rq < 0.12:
@@ -165,14 +142,14 @@ def greedy_sequence(obs: dict) -> List[int]:
 # ── LLM prompt builder ────────────────────────────────────────────────────────
 
 def build_prompt(obs: dict, task_id: str, step_num: int) -> str:
-    day      = obs.get("day", 0)
-    max_days = TASK_MAX_DAYS.get(task_id, 1)
-    season   = obs.get("season", "summer")
-    weather  = obs.get("weather", {})
-    cond     = weather.get("condition", "sunny")
-    temp     = weather.get("temp_celsius", 30)
-    rain     = weather.get("rainfall_mm", 0)
-    rqm      = weather.get("road_quality_modifier", 1.0)
+    day        = obs.get("day", 0)
+    max_days   = TASK_MAX_DAYS.get(task_id, 1)
+    season     = obs.get("season", "summer")
+    weather    = obs.get("weather", {})
+    cond       = weather.get("condition", "sunny")
+    temp       = weather.get("temp_celsius", 30)
+    rain       = weather.get("rainfall_mm", 0)
+    rqm        = weather.get("road_quality_modifier", 1.0)
     time_used  = obs.get("current_time_min", 0)
     energy     = obs.get("asha_energy_pct", 100)
     alerts     = obs.get("new_alerts", [])
@@ -180,7 +157,8 @@ def build_prompt(obs: dict, task_id: str, step_num: int) -> str:
 
     def display_score(h: dict) -> float:
         s = h.get("risk_score", 0) * 2
-        if h.get("danger_sign_active"): s += 3
+        if h.get("danger_sign_active"):
+            s += 3
         cats = {"newborn": 4, "tb_patient": 2, "high_risk_preg": 2, "diabetic": 1}
         s += cats.get(h.get("category", "routine"), 0)
         s -= h.get("dist_from_asha_home_km", 1) * 0.02
@@ -202,31 +180,32 @@ def build_prompt(obs: dict, task_id: str, step_num: int) -> str:
         )
 
     alert_lines = [
-        f"  !! {a['urgency'].upper()}: HH {a['household_id']} — {a['message']}"
+        f"  !! {a['urgency'].upper()}: HH {a['household_id']} - {a['message']}"
         for a in alerts[:5]
     ] or ["  None"]
 
     time_remaining = 360 - time_used
 
-    return f"""Day {day + 1}/{max_days} | Season: {season} | Weather: {cond} {temp}°C {rain}mm rain
-Road quality modifier today: {rqm:.2f} (1.0=normal, <0.5=roads degraded)
-Time used: {time_used} min | Time remaining: {time_remaining} min | ASHA energy: {energy:.0f}%
-
-ALERTS (act on these immediately):
-{chr(10).join(alert_lines)}
-
-TOP {len(top_hhs)} HOUSEHOLDS BY URGENCY (showing {len(top_hhs)} of {len(households)} total):
-    ID  Category              Risk  Days  Dist   Road  EstMin  Cluster  Notes
-{chr(10).join(rows)}
-
-You have {time_remaining} minutes left today.
-Plan a route that fits in this time. Group clusters to reduce travel.
-Return ONLY JSON: {{"visit_sequence": [id1, id2, ...]}}"""
+    return (
+        f"Day {day + 1}/{max_days} | Season: {season} | "
+        f"Weather: {cond} {temp}C {rain}mm rain\n"
+        f"Road quality modifier today: {rqm:.2f} (1.0=normal, <0.5=roads degraded)\n"
+        f"Time used: {time_used} min | Time remaining: {time_remaining} min | "
+        f"ASHA energy: {energy:.0f}%\n\n"
+        f"ALERTS (act on these immediately):\n"
+        f"{chr(10).join(alert_lines)}\n\n"
+        f"TOP {len(top_hhs)} HOUSEHOLDS BY URGENCY "
+        f"(showing {len(top_hhs)} of {len(households)} total):\n"
+        f"    ID  Category              Risk  Days  Dist   Road  EstMin  Cluster  Notes\n"
+        f"{chr(10).join(rows)}\n\n"
+        f"You have {time_remaining} minutes left today.\n"
+        f"Plan a route that fits in this time. Group clusters to reduce travel.\n"
+        f'Return ONLY JSON: {{"visit_sequence": [id1, id2, ...]}}'
+    )
 
 # ── Action parser ─────────────────────────────────────────────────────────────
 
 def parse_action(text: str) -> dict:
-    """Extract JSON action from model response. Robust to extra prose."""
     text  = text.strip()
     start = text.find("{")
     end   = text.rfind("}") + 1
@@ -242,26 +221,29 @@ def parse_action(text: str) -> dict:
 # ── Episode runner ────────────────────────────────────────────────────────────
 
 def run_episode(task_id: str) -> dict:
-    """Run one full episode for the given task. Returns grader result."""
     print(f"\n{'─'*60}")
     print(f"  TASK: {task_id.upper()}")
     print(f"{'─'*60}")
 
-    # FIX 1: unwrap observation from reset response
-    reset_resp = env_post("/reset", json={"task_id": task_id})
-    obs = reset_resp.get("observation", reset_resp)
+    # Reset — unwrap observation from wrapper
+    reset_raw = env_post("/reset", json={"task_id": task_id})
+    obs       = reset_raw.get("observation", reset_raw)
 
     n_hh     = len(obs.get("households", []))
     max_days = TASK_MAX_DAYS.get(task_id, 1)
-    print(f"  Households: {n_hh} | Days: {max_days} | Season: {obs.get('season')} | "
-          f"Weather: {obs.get('weather', {}).get('condition')}")
+    print(
+        f"  Households: {n_hh} | Days: {max_days} | "
+        f"Season: {obs.get('season')} | "
+        f"Weather: {obs.get('weather', {}).get('condition')}"
+    )
 
     total_reward = 0.0
+    step_num     = 0
 
     for step_num in range(MAX_STEPS):
         user_prompt = build_prompt(obs, task_id, step_num)
 
-        # ── LLM call ──────────────────────────────────────────────────────────
+        # LLM call
         action_obj = None
         try:
             completion = client.chat.completions.create(
@@ -282,23 +264,25 @@ def run_episode(task_id: str) -> dict:
 
         visit_seq = action_obj.get("visit_sequence", [])
 
-        # FIX 2: wrap action correctly for the server
-        result = env_post("/step", json={"action": {"visit_sequence": visit_seq}})
+        # Step — action wrapped correctly for openenv-core
+        step_raw = env_post("/step", json={"action": {"visit_sequence": visit_seq}})
 
-        # FIX 3: unwrap observation from step response
-        obs    = result.get("observation", result)
-        reward = result.get("reward", obs.get("reward", 0.0))
-        done   = result.get("done",   obs.get("done",   False))
-        meta   = obs.get("metadata", {})
+        # KEY FIX: read done/reward from TOP-LEVEL response only
+        reward = step_raw.get("reward", 0.0)
+        done   = step_raw.get("done",   False)
+
+        # Unwrap observation for next loop iteration
+        obs  = step_raw.get("observation", step_raw)
+        meta = obs.get("metadata", {})
         total_reward += reward
 
         print(
             f"  Day {step_num+1:>2}/{max_days}  "
-            f"visits={meta.get('visits_completed',0):>2}  "
-            f"travel={meta.get('total_travel_min',0):>4.0f}min  "
-            f"energy={meta.get('asha_energy_end',100):>4.0f}%  "
-            f"deaths={meta.get('new_deaths',0)}  "
-            f"weather={meta.get('weather','?'):10s}  "
+            f"visits={meta.get('visits_completed', 0):>2}  "
+            f"travel={meta.get('total_travel_min', 0):>4.0f}min  "
+            f"energy={meta.get('asha_energy_end', 100):>4.0f}%  "
+            f"deaths={meta.get('new_deaths', 0)}  "
+            f"weather={obs.get('weather', {}).get('condition', '?'):10s}  "
             f"r={reward:+.3f}"
         )
 
@@ -307,25 +291,24 @@ def run_episode(task_id: str) -> dict:
 
         time.sleep(0.05)
 
-    # FIX 4: /grade may not exist — fall back gracefully
+    # Grade
     score = 0.0
     try:
         grade = env_get("/grade")
         score = grade.get("score", 0.0)
     except Exception:
-        # derive a rough score from cumulative reward if /grade is unavailable
-        score = round(max(0.0, min(1.0, (total_reward + 1.0) / 2.0)), 4)
+        score = round(max(0.0, min(1.0, total_reward / max(step_num + 1, 1))), 4)
 
-    # FIX 5: get dbi/tb/deaths from /state
-    state = {}
+    # Extra metrics from state
+    env_state = {}
     try:
-        state = env_get("/state")
+        env_state = env_get("/state")
     except Exception:
         pass
 
-    dbi  = state.get("disease_burden_index", 0.0)
-    tb   = state.get("tb_compliance_rate",   0.0)
-    dead = state.get("preventable_deaths",   0)
+    dbi  = env_state.get("disease_burden_index", 0.0)
+    tb   = env_state.get("tb_compliance_rate",   0.0)
+    dead = env_state.get("preventable_deaths",   0)
 
     print(f"\n  {'─'*50}")
     print(f"  Score          : {score:.4f}")
@@ -351,12 +334,14 @@ def main():
     print("=" * 60)
     print(f"  Model   : {MODEL_NAME}")
     print(f"  Env URL : {ENV_URL}")
-    print(f"  Tasks   : task1 (easy) → task2 (medium) → task3 (hard)")
+    print(f"  Tasks   : task1 (easy) -> task2 (medium) -> task3 (hard)")
 
     try:
         health = env_get("/health")
-        print(f"  Env OK  : {health.get('environment', 'asha-village-health')} "
-              f"v{health.get('version', '2.0.0')}")
+        print(
+            f"  Env OK  : {health.get('environment', 'asha-village-health')} "
+            f"v{health.get('version', '2.0.0')}"
+        )
     except Exception as exc:
         print(f"  [WARN] Cannot reach environment at {ENV_URL}: {exc}")
         print("  Make sure the server is running: uvicorn server.app:app --port 8000")
@@ -370,9 +355,12 @@ def main():
         except Exception as exc:
             print(f"\n  [ERROR] Task {task_id} failed: {exc}")
             results.append({
-                "task_id": task_id, "score": 0.0,
-                "disease_burden_index": 1.0, "tb_compliance_rate": 0.0,
-                "preventable_deaths": -1, "total_reward": 0.0,
+                "task_id":              task_id,
+                "score":                0.0,
+                "disease_burden_index": 1.0,
+                "tb_compliance_rate":   0.0,
+                "preventable_deaths":   -1,
+                "total_reward":         0.0,
             })
 
     print(f"\n{'='*60}")
