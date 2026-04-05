@@ -20,7 +20,7 @@ AGENT STRATEGY:
     • ASHA's remaining time and energy
     • Estimated travel + visit time per household
     • Season-specific disease risk context
-  
+
   The agent must plan a route that:
     1. Prioritises danger signs and newborns
     2. Clusters households geographically to minimise travel
@@ -31,11 +31,10 @@ AGENT STRATEGY:
 """
 
 import json
-import math
 import os
 import sys
 import time
-from typing import List, Optional
+from typing import List
 
 import requests
 from openai import OpenAI
@@ -47,12 +46,15 @@ MODEL_NAME   = os.environ.get("MODEL_NAME",   "gpt-4o-mini")
 HF_TOKEN     = os.environ.get("HF_TOKEN",     os.environ.get("OPENAI_API_KEY", ""))
 ENV_URL      = os.environ.get("ENV_URL",      "http://localhost:8000")
 
-TEMPERATURE  = 0.0      # deterministic outputs
-MAX_TOKENS   = 512      # short JSON response
-MAX_STEPS    = 32       # safety cap per episode
+TEMPERATURE     = 0.0   # deterministic outputs
+MAX_TOKENS      = 512   # short JSON response
+MAX_STEPS       = 32    # safety cap per episode
 REQUEST_TIMEOUT = 30    # seconds per env call
 
-client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+# Task day counts — used for display only (Observation doesn't expose max_days)
+TASK_MAX_DAYS = {"task1": 1, "task2": 7, "task3": 30}
+
+client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN or "placeholder")
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 
@@ -128,8 +130,8 @@ def greedy_sequence(obs: dict) -> List[int]:
     }
 
     def estimate_travel_min(h: dict) -> float:
-        rq   = max(0.05, h.get("road_quality", 0.5))
-        dist = h.get("dist_from_asha_home_km", 1.0)
+        rq    = max(0.05, h.get("road_quality", 0.5))
+        dist  = h.get("dist_from_asha_home_km", 1.0)
         speed = rq * 5.0
         if weather == "heavy_rain" and rq < 0.40:
             speed *= 0.40
@@ -139,19 +141,13 @@ def greedy_sequence(obs: dict) -> List[int]:
         s = h.get("risk_score", 0)
         if h.get("danger_sign_active"):           s += 1.5
         s += CATEGORY_WEIGHT.get(h.get("category", "routine"), 0.5)
-
         rq = h.get("road_quality", 0.5)
-        # Heavily penalise mud paths in heavy rain
         if weather == "heavy_rain" and rq < 0.12:
             s -= 5.0
-        # Small penalty for distance
         s -= h.get("dist_from_asha_home_km", 1.0) * 0.03
         return s
 
-    # Sort by score descending
-    ranked = sorted(households, key=score, reverse=True)
-
-    # Fit within time budget (rough estimate from home for all hops)
+    ranked   = sorted(households, key=score, reverse=True)
     selected = []
     elapsed  = 0.0
     for h in ranked:
@@ -168,25 +164,20 @@ def greedy_sequence(obs: dict) -> List[int]:
 
 # ── LLM prompt builder ────────────────────────────────────────────────────────
 
-def build_prompt(obs: dict) -> str:
-    """
-    Build the user prompt from the current observation.
-    Shows the top households sorted by urgency with all spatial/time info.
-    """
+def build_prompt(obs: dict, task_id: str, step_num: int) -> str:
     day      = obs.get("day", 0)
-    max_days = obs.get("max_days", 1)
+    max_days = TASK_MAX_DAYS.get(task_id, 1)   # FIX: Observation doesn't expose max_days
     season   = obs.get("season", "summer")
     weather  = obs.get("weather", {})
     cond     = weather.get("condition", "sunny")
     temp     = weather.get("temp_celsius", 30)
     rain     = weather.get("rainfall_mm", 0)
     rqm      = weather.get("road_quality_modifier", 1.0)
-    time_used = obs.get("current_time_min", 0)
-    energy   = obs.get("asha_energy_pct", 100)
-    alerts   = obs.get("new_alerts", [])
+    time_used  = obs.get("current_time_min", 0)
+    energy     = obs.get("asha_energy_pct", 100)
+    alerts     = obs.get("new_alerts", [])
     households = obs.get("households", [])
 
-    # Score for display ordering
     def display_score(h: dict) -> float:
         s = h.get("risk_score", 0) * 2
         if h.get("danger_sign_active"): s += 3
@@ -199,9 +190,9 @@ def build_prompt(obs: dict) -> str:
 
     rows = []
     for h in top_hhs:
-        rq     = h.get("road_quality", 0.5)
-        dist   = h.get("dist_from_asha_home_km", 1.0)
-        danger = "DANGER!" if h.get("danger_sign_active") else ""
+        rq        = h.get("road_quality", 0.5)
+        dist      = h.get("dist_from_asha_home_km", 1.0)
+        danger    = "DANGER!" if h.get("danger_sign_active") else ""
         rain_warn = " [RAIN+MUD]" if cond == "heavy_rain" and rq < 0.20 else ""
         rows.append(
             f"  {h['id']:>4}  {h['category']:20s}  risk={h['risk_score']:.2f}  "
@@ -236,8 +227,7 @@ Return ONLY JSON: {{"visit_sequence": [id1, id2, ...]}}"""
 
 def parse_action(text: str) -> dict:
     """Extract JSON action from model response. Robust to extra prose."""
-    text = text.strip()
-    # Find JSON object
+    text  = text.strip()
     start = text.find("{")
     end   = text.rfind("}") + 1
     if start >= 0 and end > start:
@@ -257,17 +247,16 @@ def run_episode(task_id: str) -> dict:
     print(f"  TASK: {task_id.upper()}")
     print(f"{'─'*60}")
 
-    # Reset environment
     obs = env_post(f"/reset?task_id={task_id}")
-    n_hh    = len(obs.get("households", []))
-    max_days = obs.get("max_days", 1)
-    print(f"  Households: {n_hh} | Days: {max_days} | Season: {obs.get('season')} | Weather: {obs.get('weather', {}).get('condition')}")
+    n_hh     = len(obs.get("households", []))
+    max_days = TASK_MAX_DAYS.get(task_id, 1)
+    print(f"  Households: {n_hh} | Days: {max_days} | Season: {obs.get('season')} | "
+          f"Weather: {obs.get('weather', {}).get('condition')}")
 
     total_reward = 0.0
 
     for step_num in range(MAX_STEPS):
-        # ── Build prompt ──────────────────────────────────────────────────────
-        user_prompt = build_prompt(obs)
+        user_prompt = build_prompt(obs, task_id, step_num)
 
         # ── LLM call ──────────────────────────────────────────────────────────
         action_obj = None
@@ -282,7 +271,7 @@ def run_episode(task_id: str) -> dict:
                 max_tokens=MAX_TOKENS,
                 stream=False,
             )
-            raw = completion.choices[0].message.content or FALLBACK_ACTION
+            raw        = completion.choices[0].message.content or FALLBACK_ACTION
             action_obj = parse_action(raw)
         except Exception as exc:
             print(f"  [LLM error day {step_num+1}] {exc} — using greedy fallback")
@@ -291,11 +280,10 @@ def run_episode(task_id: str) -> dict:
         visit_seq = action_obj.get("visit_sequence", [])
 
         # ── Step ──────────────────────────────────────────────────────────────
-        result = env_post("/step", json={"visit_sequence": visit_seq})
-
-        reward        = result.get("reward", 0.0)
-        done          = result.get("done", False)
-        meta          = result.get("metadata", {})
+        result       = env_post("/step", json={"visit_sequence": visit_seq})
+        reward       = result.get("reward", 0.0)
+        done         = result.get("done", False)
+        meta         = result.get("metadata", {})
         total_reward += reward
 
         print(
@@ -312,26 +300,38 @@ def run_episode(task_id: str) -> dict:
         if done:
             break
 
-        time.sleep(0.05)   # gentle rate limiting
+        time.sleep(0.05)
 
-    # ── Final grade ───────────────────────────────────────────────────────────
+    # ── Final grade + state ────────────────────────────────────────────────────
+    # FIX: /grade returns only {"score": float}
+    #      disease_burden_index, tb_compliance_rate live in /state
     grade = env_get("/grade")
     score = grade.get("score", 0.0)
 
+    state = {}
+    try:
+        state = env_get("/state")
+    except Exception:
+        pass  # /state is optional for display
+
+    dbi  = state.get("disease_burden_index", grade.get("disease_burden_index", 0.0))
+    tb   = state.get("tb_compliance_rate",   grade.get("tb_compliance_rate",   0.0))
+    dead = state.get("preventable_deaths",   grade.get("preventable_deaths",   0))
+
     print(f"\n  {'─'*50}")
     print(f"  Score          : {score:.4f}")
-    print(f"  Disease burden : {grade.get('disease_burden_index', 0):.4f}")
-    print(f"  TB compliance  : {grade.get('tb_compliance_rate', 0):.4f}")
-    print(f"  Deaths         : {grade.get('preventable_deaths', 0)}")
+    print(f"  Disease burden : {dbi:.4f}")
+    print(f"  TB compliance  : {tb:.4f}")
+    print(f"  Deaths         : {dead}")
     print(f"  Total reward   : {total_reward:.3f}")
 
     return {
-        "task_id":               task_id,
-        "score":                 score,
-        "disease_burden_index":  grade.get("disease_burden_index", 0),
-        "tb_compliance_rate":    grade.get("tb_compliance_rate", 0),
-        "preventable_deaths":    grade.get("preventable_deaths", 0),
-        "total_reward":          round(total_reward, 3),
+        "task_id":              task_id,
+        "score":                score,
+        "disease_burden_index": dbi,
+        "tb_compliance_rate":   tb,
+        "preventable_deaths":   dead,
+        "total_reward":         round(total_reward, 3),
     }
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -344,10 +344,10 @@ def main():
     print(f"  Env URL : {ENV_URL}")
     print(f"  Tasks   : task1 (easy) → task2 (medium) → task3 (hard)")
 
-    # Verify environment is reachable
     try:
         health = env_get("/health")
-        print(f"  Env OK  : {health.get('environment', '?')} v{health.get('version', '?')}")
+        print(f"  Env OK  : {health.get('environment', 'asha-village-health')} "
+              f"v{health.get('version', '2.0.0')}")
     except Exception as exc:
         print(f"  [WARN] Cannot reach environment at {ENV_URL}: {exc}")
         print("  Make sure the server is running: uvicorn server.app:app --port 8000")
@@ -366,7 +366,6 @@ def main():
                 "preventable_deaths": -1, "total_reward": 0.0,
             })
 
-    # ── Summary table ─────────────────────────────────────────────────────────
     print(f"\n{'='*60}")
     print("  FINAL BASELINE SCORES")
     print(f"{'='*60}")
