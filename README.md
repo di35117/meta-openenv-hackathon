@@ -170,7 +170,7 @@ Ordered list of household IDs. First = highest priority. Max 15.
 
 ### Local development
 ```bash
-git clone https://huggingface.co/spaces/YOUR_USERNAME/asha-village-health
+git clone https://huggingface.co/spaces/di35117/asha-village-health
 cd asha-village-health
 pip install -r requirements.txt
 uvicorn server.app:app --reload --port 8000
@@ -185,10 +185,18 @@ docker run -p 8000:8000 asha-openenv
 
 ### Run inference baseline
 ```bash
+# Option 1 — HuggingFace (free)
+export API_BASE_URL="https://router.huggingface.co/v1"
+export MODEL_NAME="meta-llama/Llama-3.1-8B-Instruct"
+export HF_TOKEN="hf_your_token_here"
+export ENV_URL="https://di35117-asha-village-health.hf.space"
+python inference.py
+
+# Option 2 — OpenAI
 export API_BASE_URL="https://api.openai.com/v1"
 export MODEL_NAME="gpt-4o-mini"
-export HF_TOKEN="sk-..."
-export ENV_URL="http://localhost:8000"
+export OPENAI_API_KEY="sk-your-key-here"
+export ENV_URL="https://di35117-asha-village-health.hf.space"
 python inference.py
 ```
 
@@ -198,9 +206,9 @@ python inference.py
 
 | Task | Score | Disease Burden | TB Compliance | Deaths |
 |------|-------|----------------|---------------|--------|
-| task1 | ~0.85 | ~0.15 | 1.00 | 0 |
-| task2 | ~0.45 | ~0.35 | ~0.55 | 0 |
-| task3 | ~0.40 | ~0.55 | ~0.25 | ~50 |
+| task1 | ~1.0000 | ~0.1999 | 1.0000 | 0 |
+| task2 | ~0.3575 | ~0.3744 | ~0.5185 | 0 |
+| task3 | ~0.4521 | ~0.6867 | ~0.0976 | ~168 |
 
 A trained RL agent is expected to significantly improve task3 by discovering:
 - Monsoon cluster batching (visit east/west clusters only on non-rain days)
