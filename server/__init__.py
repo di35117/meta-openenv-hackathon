@@ -4,8 +4,13 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""My Env environment server components."""
+"""My Env Environment."""
 
-from .my_env_environment import MyEnvironment
+from .client import MyEnv
+from .models import Action as MyAction, Observation as MyObservation
 
-__all__ = ["MyEnvironment"]
+__all__ = [
+    "MyAction",
+    "MyObservation",
+    "MyEnv",
+]
