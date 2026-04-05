@@ -1,10 +1,154 @@
-name: "asha-rural-health"
-version: "1.0.0"
-description: "ASHA Worker resource allocation and patient prioritization in rural India."
+name: "asha-village-health"
+version: "2.0.0"
+description: >
+  RL environment simulating an ASHA (Accredited Social Health Activist) worker
+  scheduling daily household visits across a rural Indian village.
+  Includes real 2-D coordinates, road-quality-aware travel time,
+  daily weather dynamics, ASHA fatigue/energy, and seasonal disease rates.
+  The agent must discover a scheduling policy that minimises village disease
+  burden under time, distance, and resource constraints.
+
+author: "openenv-participant"
+tags:
+  - openenv
+  - healthcare
+  - rural-india
+  - scheduling
+  - reinforcement-learning
+  - real-world
+
+observation_space:
+  type: object
+  description: >
+    Full current state visible to the agent each day.
+    Includes spatial household data, today's weather,
+    the ASHA's time and energy budget, and any new alerts.
+  properties:
+    day:
+      type: integer
+      description: Current simulation day (0-indexed)
+    season:
+      type: string
+      enum: [summer, monsoon, winter]
+    weather:
+      type: object
+      properties:
+        condition:            { type: string, enum: [sunny, cloudy, rainy, heavy_rain] }
+        temp_celsius:         { type: number }
+        rainfall_mm:          { type: number }
+        road_quality_modifier:{ type: number, description: "1.0=normal, <0.5=roads degraded" }
+    current_time_min:
+      type: integer
+      description: Minutes used so far today (0 = 7:00 AM, 360 = 1:00 PM)
+    asha_energy_pct:
+      type: number
+      description: ASHA fatigue level (100=fresh, <30=exhausted → slower visits)
+    asha_home_x:
+      type: number
+      description: ASHA's home x-coordinate in km (routing start point)
+    asha_home_y:
+      type: number
+    households:
+      type: array
+      description: Every known household in the village
+      items:
+        type: object
+        properties:
+          id:                   { type: integer }
+          category:             { type: string, enum: [newborn, tb_patient, high_risk_preg, diabetic, routine] }
+          risk_score:           { type: number, minimum: 0.0, maximum: 1.0 }
+          days_since_visit:     { type: integer }
+          danger_sign_active:   { type: boolean }
+          geo_cluster:          { type: integer, minimum: 0, maximum: 4 }
+          x:                    { type: number, description: "km from west edge (0–10)" }
+          y:                    { type: number, description: "km from south edge (0–10)" }
+          road_quality:         { type: number, description: "0=mud path, 1=paved, adjusted for today's weather" }
+          dist_from_asha_home_km: { type: number }
+          est_visit_duration_min: { type: integer, description: "estimated visit time before entering" }
+    new_alerts:
+      type: array
+      items:
+        type: object
+        properties:
+          household_id: { type: integer }
+          message:      { type: string }
+          urgency:      { type: string, enum: [critical, high, routine] }
+    reward:  { type: number }
+    done:    { type: boolean }
+
+action_space:
+  type: object
+  description: >
+    Ordered list of household IDs for the ASHA to visit today.
+    The environment simulates travel + visit time for each stop
+    and stops the route when the 360-minute budget is exhausted.
+  properties:
+    visit_sequence:
+      type: array
+      items: { type: integer }
+      maxItems: 15
+      description: Household IDs in visit order. First = highest priority.
+
 tasks:
   - id: "task1"
+    name: "Single-day triage"
     difficulty: "easy"
+    max_steps: 1
+    score_range: [0.0, 1.0]
+    description: >
+      30 households, 1 summer day. 8 critical cases present.
+      Full observability, flat terrain.
+    grader: "fraction of pre-visit danger-sign households visited"
+
   - id: "task2"
+    name: "Week-long scheduling"
     difficulty: "medium"
+    max_steps: 7
+    score_range: [0.0, 1.0]
+    description: >
+      100 households, 7 days, mixed summer weather.
+      TB patients need 3-day DOTS cycles. Surprise alerts mid-week.
+      Travel time and road quality matter.
+    grader: "0.5 × weighted_coverage + 0.5 × tb_compliance_rate"
+
   - id: "task3"
+    name: "Monthly village management"
     difficulty: "hard"
+    max_steps: 30
+    score_range: [0.0, 1.0]
+    description: >
+      200 households, 30 days, monsoon season.
+      Heavy rain degrades dirt paths to near-impassable.
+      TB cluster forming. 3 high-risk pregnancies near term.
+      Disease events 3.5× more frequent.
+    grader: "0.6 × (1−DBI) + 0.25 × equity + 0.15 × routing_efficiency"
+
+api:
+  reset:
+    method: POST
+    path: /reset
+    query_params:
+      task_id: { type: string, default: task1 }
+  step:
+    method: POST
+    path: /step
+    body: action_space
+  state:
+    method: GET
+    path: /state
+  grade:
+    method: GET
+    path: /grade
+  health:
+    method: GET
+    path: /health
+
+reward:
+  range: [-1.0, 1.0]
+  shaped: true
+  description: >
+    Per-step reward shaped for partial progress.
+    Positive: catching danger signs (+0.4), referrals (+0.3),
+    newborn 48hr visits (+0.25), TB dose on time (+0.15).
+    Negative: preventable death (-1.0), wasted visits (-0.05).
+    Bonuses: time efficiency, geographic clustering.
