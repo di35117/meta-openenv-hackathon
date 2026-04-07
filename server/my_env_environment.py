@@ -96,6 +96,10 @@ class MyEnvironment(_Base):
             season=self.task.season,
             start_day_of_year=self.task.start_day_of_year,
         )
+        if self.task.id == "task1":
+            for hh in self.village.rng.sample(list(self.village.households.values()), 8):
+                hh.risk_score = self.village.rng.uniform(0.76, 0.95)
+                hh.danger_sign_active = True
         self.day       = 0
         self.history: list = []
         self._current_alerts: list = []
@@ -117,6 +121,10 @@ class MyEnvironment(_Base):
             season=self.task.season,
             start_day_of_year=self.task.start_day_of_year,
         )
+        if self.task.id == "task1":
+            for hh in self.village.rng.sample(list(self.village.households.values()), 8):
+                hh.risk_score = self.village.rng.uniform(0.76, 0.95)
+                hh.danger_sign_active = True
         self.day     = 0
         self.history = []
         self._current_alerts = []
