@@ -18,7 +18,7 @@ import json
 import os
 import sys
 import time
-from typing import List
+from typing import List, Optional
 
 import requests
 from openai import OpenAI
@@ -30,6 +30,7 @@ MODEL_NAME   = os.environ.get("MODEL_NAME",   "<your-active-model>")
 HF_TOKEN     = os.environ.get("HF_TOKEN")
 ENV_URL      = os.environ.get("ENV_URL",      "http://localhost:8000")
 
+BENCHMARK       = "asha-village-health"
 TEMPERATURE     = 0.0
 MAX_TOKENS      = 512
 MAX_STEPS       = 32
@@ -77,6 +78,30 @@ Order the list by priority: most urgent first, then cluster nearby households.
 """.strip()
 
 FALLBACK_ACTION = '{"visit_sequence": []}'
+
+# ── Structured output helpers ─────────────────────────────────────────────────
+
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={task} env={env} model={model}", flush=True)
+
+
+def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    error_val = error if error else "null"
+    done_val  = str(done).lower()
+    print(
+        f"[STEP] step={step} action={action} reward={reward:.2f} "
+        f"done={done_val} error={error_val}",
+        flush=True,
+    )
+
+
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    print(
+        f"[END] success={str(success).lower()} steps={steps} "
+        f"score={score:.2f} rewards={rewards_str}",
+        flush=True,
+    )
 
 # ── Environment HTTP helpers ──────────────────────────────────────────────────
 
@@ -248,28 +273,23 @@ def parse_action(text: str) -> dict:
 # ── Episode runner ────────────────────────────────────────────────────────────
 
 def run_episode(task_id: str) -> dict:
-    # ── REQUIRED structured output: START block ───────────────────────────────
-    print(f"[START] task={task_id}", flush=True)
+    # [START] — required format: task= env= model=
+    log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
 
     reset_raw = env_post("/reset", json={"task_id": task_id})
     obs       = reset_raw.get("observation", reset_raw)
 
-    n_hh     = len(obs.get("households", []))
-    max_days = TASK_MAX_DAYS.get(task_id, 1)
-    print(
-        f"  Households: {n_hh} | Days: {max_days} | "
-        f"Season: {obs.get('season')} | "
-        f"Weather: {obs.get('weather', {}).get('condition')}",
-        flush=True
-    )
+    rewards:  List[float] = []
+    step_num: int         = 0
+    last_error: Optional[str] = None
 
-    total_reward = 0.0
-    step_num     = 0
-
-    for step_num in range(MAX_STEPS):
+    for step_num in range(1, MAX_STEPS + 1):
         user_prompt = build_prompt(obs, task_id, step_num)
 
-        action_obj = None
+        action_obj  = None
+        action_str  = "[]"
+        last_error  = None
+
         try:
             completion = client.chat.completions.create(
                 model=MODEL_NAME,
@@ -284,10 +304,11 @@ def run_episode(task_id: str) -> dict:
             raw        = completion.choices[0].message.content or FALLBACK_ACTION
             action_obj = parse_action(raw)
         except Exception as exc:
-            print(f"  [LLM error day {step_num+1}] {exc} — using greedy fallback", flush=True)
+            last_error = str(exc)
             action_obj = {"visit_sequence": greedy_sequence(obs)}
 
-        visit_seq = action_obj.get("visit_sequence", [])
+        visit_seq  = action_obj.get("visit_sequence", [])
+        action_str = str(visit_seq)
 
         step_raw = env_post("/step", json={
             "action":  {"visit_sequence": visit_seq},
@@ -297,16 +318,15 @@ def run_episode(task_id: str) -> dict:
         reward = step_raw.get("reward", 0.0)
         done   = step_raw.get("done",   False)
         obs    = step_raw.get("observation", step_raw)
-        meta   = obs.get("metadata", {})
-        total_reward += reward
+        rewards.append(reward)
 
-        # ── REQUIRED structured output: STEP block ────────────────────────────
-        print(
-            f"[STEP] step={step_num + 1} reward={reward:.4f} "
-            f"visits={meta.get('visits_completed', 0)} "
-            f"deaths={meta.get('new_deaths', 0)} "
-            f"weather={obs.get('weather', {}).get('condition', '?')}",
-            flush=True
+        # [STEP] — required format: step= action= reward= done= error=
+        log_step(
+            step=step_num,
+            action=action_str,
+            reward=reward,
+            done=done,
+            error=last_error,
         )
 
         if done:
@@ -320,9 +340,10 @@ def run_episode(task_id: str) -> dict:
         grade = env_get(f"/grade?task_id={task_id}")
         score = grade.get("score", 0.0)
     except Exception:
-        score = round(max(0.0, min(1.0, total_reward / max(step_num + 1, 1))), 4)
+        total = sum(rewards)
+        score = round(max(0.0, min(1.0, total / max(step_num, 1))), 4)
 
-    # Extra metrics from state
+    # Extra metrics from state (for the summary table — not in [END] line)
     env_state = {}
     try:
         env_state = env_get(f"/state?task_id={task_id}")
@@ -333,13 +354,11 @@ def run_episode(task_id: str) -> dict:
     tb   = env_state.get("tb_compliance_rate",   0.0)
     dead = env_state.get("preventable_deaths",   0)
 
-    # ── REQUIRED structured output: END block ─────────────────────────────────
-    print(
-        f"[END] task={task_id} score={score:.4f} steps={step_num + 1} "
-        f"total_reward={total_reward:.3f} deaths={dead} "
-        f"disease_burden={dbi:.4f} tb_compliance={tb:.4f}",
-        flush=True
-    )
+    # success = score > 0 (reasonable threshold for this environment)
+    success = score > 0.0
+
+    # [END] — required format: success= steps= score= rewards=
+    log_end(success=success, steps=step_num, score=score, rewards=rewards)
 
     return {
         "task_id":              task_id,
@@ -347,7 +366,7 @@ def run_episode(task_id: str) -> dict:
         "disease_burden_index": dbi,
         "tb_compliance_rate":   tb,
         "preventable_deaths":   dead,
-        "total_reward":         round(total_reward, 3),
+        "total_reward":         round(sum(rewards), 3),
     }
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -379,11 +398,8 @@ def main():
             results.append(result)
         except Exception as exc:
             print(f"\n  [ERROR] Task {task_id} failed: {exc}", flush=True)
-            print(
-                f"[END] task={task_id} score=0.0 steps=0 total_reward=0.0 "
-                f"deaths=-1 disease_burden=1.0 tb_compliance=0.0",
-                flush=True
-            )
+            # Still emit a valid [END] block so the validator doesn't fail
+            log_end(success=False, steps=0, score=0.0, rewards=[])
             results.append({
                 "task_id":              task_id,
                 "score":                0.0,
