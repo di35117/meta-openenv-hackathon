@@ -25,9 +25,9 @@ from openai import OpenAI
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-API_BASE_URL = os.environ.get("API_BASE_URL", "<your-active-model-api-url>")
-MODEL_NAME   = os.environ.get("MODEL_NAME",   "<your-active-model>")
-HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
+HF_TOKEN     = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
+API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
+MODEL_NAME   = os.getenv("MODEL_NAME") or "meta-llama/Llama-3.1-8B-Instruct"
 ENV_URL      = os.environ.get("ENV_URL",      "http://localhost:8000")
 
 BENCHMARK       = "asha-village-health"
