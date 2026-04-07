@@ -7,10 +7,20 @@ What changed:
     to correctly credit the agent for catching danger signs
   • Task 3 grader adds a routing-efficiency component:
     agents that wasted time on long travel routes are penalised
+  • All grader scores clamped to (0.001, 0.999) — validator requires
+    strictly open interval (0, 1); exact 0.0 or 1.0 would fail the check
 """
 
 from dataclasses import dataclass
 from typing import Any
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper: clamp score to open interval (0, 1) as required by validator
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _clamp(score: float) -> float:
+    return round(max(0.001, min(0.999, score)), 4)
 
 
 @dataclass
@@ -94,10 +104,10 @@ def grade_task1(state: Any) -> float:
 
     Uses danger_ids_before from history (snapshotted before visits on that day)
     so that visiting a household and clearing its danger flag still counts.
-    Score range: 0.0 – 1.0.  Deterministic.
+    Score range: (0.001, 0.999) after clamp.  Deterministic.
     """
     if not state.visit_history:
-        return 0.0
+        return 0.001
 
     # Collect all danger-sign IDs that existed at the START of day 0
     danger_before: set[int] = set()
@@ -106,14 +116,14 @@ def grade_task1(state: Any) -> float:
 
     if not danger_before:
         # No danger signs in this episode — give full credit
-        return 1.0
+        return 0.999
 
     visited_ids: set[int] = set()
     for day_log in state.visit_history:
         visited_ids.update(day_log.get("visited", []))
 
     caught = len(danger_before & visited_ids)
-    return round(caught / len(danger_before), 4)
+    return _clamp(caught / len(danger_before))
 
 
 def grade_task2(state: Any) -> float:
@@ -122,7 +132,7 @@ def grade_task2(state: Any) -> float:
 
     Weighted coverage: visits are weighted by household category importance.
     TB compliance: fraction of 3-day DOTS windows honoured.
-    Score range: 0.0 – 1.0.  Deterministic.
+    Score range: (0.001, 0.999) after clamp.  Deterministic.
     """
     weights = {
         "newborn":        3.0,
@@ -149,7 +159,7 @@ def grade_task2(state: Any) -> float:
 
     tb_score = state.tb_compliance_rate
 
-    return round(0.5 * coverage_score + 0.5 * tb_score, 4)
+    return _clamp(0.5 * coverage_score + 0.5 * tb_score)
 
 
 def grade_task3(state: Any) -> float:
@@ -162,7 +172,7 @@ def grade_task3(state: Any) -> float:
     equity_score:         how evenly visits are distributed across clusters.
     routing_efficiency:   fraction of days where travel < 35% of working time.
                           Penalises agents that waste time on inefficient routes.
-    Score range: 0.0 – 1.0.  Deterministic.
+    Score range: (0.001, 0.999) after clamp.  Deterministic.
     """
     dbi_score = 1.0 - state.disease_burden_index
 
@@ -195,11 +205,10 @@ def grade_task3(state: Any) -> float:
         if state.visit_history else 0.0
     )
 
-    return round(
+    return _clamp(
         0.60 * dbi_score
         + 0.25 * equity_score
-        + 0.15 * routing_score,
-        4,
+        + 0.15 * routing_score
     )
 
 
