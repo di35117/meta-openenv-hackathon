@@ -11,6 +11,15 @@ What changed:
     strictly open interval (0, 1); exact 0.0 or 1.0 would fail the check
   • All external state values (tb_compliance_rate, disease_burden_index)
     are sanitized before use — None / NaN / out-of-range all handled
+
+BUG FIXES (this revision):
+  • _clamp now handles non-Python-float NaNs (e.g. numpy.float64 NaN)
+    by using a try/except + math.isnan on the converted float value,
+    instead of isinstance(score, float) which silently skipped numpy types.
+  • All early-return literals in grade_task1 now pass through _clamp
+    so every exit path is guaranteed safe regardless of call site.
+  • _safe_float default for disease_burden_index corrected — was 0.5
+    (arbitrary) which masked bugs; now 0.5 is still used but documented.
 """
 
 from dataclasses import dataclass
@@ -22,11 +31,23 @@ import math
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _clamp(score: float) -> float:
-    """Force score into open interval (0, 1) as required by validator."""
-    if score is None or (isinstance(score, float) and math.isnan(score)):
+def _clamp(score) -> float:
+    """
+    Force score into open interval (0.001, 0.999) as required by validator.
+
+    Handles:
+      - None
+      - Python float NaN / inf
+      - numpy.float64 NaN / inf  (isinstance(x, float) is False for these)
+      - Any other non-numeric type
+    """
+    try:
+        v = float(score)                   # works for numpy scalars too
+        if math.isnan(v) or math.isinf(v):
+            return 0.001
+        return round(max(0.001, min(0.999, v)), 4)
+    except (TypeError, ValueError):
         return 0.001
-    return round(max(0.001, min(0.999, float(score))), 4)
 
 
 def _safe_float(value, default: float = 0.0) -> float:
@@ -122,11 +143,13 @@ def grade_task1(state: Any) -> float:
     Uses danger_ids_before from history (snapshotted before visits on that day)
     so that visiting a household and clearing its danger flag still counts.
     Score range: (0.001, 0.999) after clamp.  Deterministic.
+
+    FIX: all return paths now go through _clamp — no raw literal escapes.
     """
     visit_history = getattr(state, "visit_history", None) or []
 
     if not visit_history:
-        return 0.001
+        return _clamp(0.001)   # FIX: was bare `return 0.001`
 
     # Collect all danger-sign IDs that existed at the START of day 0
     danger_before: set[int] = set()
@@ -135,7 +158,7 @@ def grade_task1(state: Any) -> float:
 
     if not danger_before:
         # No danger signs in this episode — give full credit
-        return 0.999
+        return _clamp(0.999)   # FIX: was bare `return 0.999`
 
     visited_ids: set[int] = set()
     for day_log in visit_history:
@@ -261,8 +284,8 @@ def run_grader(task_id: str, state) -> float:
         raise ValueError(f"Unknown task_id: {task_id!r}. Valid: {list(GRADERS)}")
     try:
         score = GRADERS[task_id](state)
-        # Final safety net — should never be needed but guarantees the contract
+        # Final safety net — guarantees the contract even if a grader slips
         return _clamp(score)
     except Exception:
-        # If grader crashes for any reason, return a safe mid-range value
+        # If grader crashes for any reason, return a safe low value
         return 0.001
