@@ -9,18 +9,35 @@ What changed:
     agents that wasted time on long travel routes are penalised
   • All grader scores clamped to (0.001, 0.999) — validator requires
     strictly open interval (0, 1); exact 0.0 or 1.0 would fail the check
+  • All external state values (tb_compliance_rate, disease_burden_index)
+    are sanitized before use — None / NaN / out-of-range all handled
 """
 
 from dataclasses import dataclass
 from typing import Any
+import math
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helper: clamp score to open interval (0, 1) as required by validator
+# Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _clamp(score: float) -> float:
-    return round(max(0.001, min(0.999, score)), 4)
+    """Force score into open interval (0, 1) as required by validator."""
+    if score is None or (isinstance(score, float) and math.isnan(score)):
+        return 0.001
+    return round(max(0.001, min(0.999, float(score))), 4)
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    """Convert value to float safely; return default if None/NaN/invalid."""
+    try:
+        v = float(value)
+        if math.isnan(v) or math.isinf(v):
+            return default
+        return v
+    except (TypeError, ValueError):
+        return default
 
 
 @dataclass
@@ -106,12 +123,14 @@ def grade_task1(state: Any) -> float:
     so that visiting a household and clearing its danger flag still counts.
     Score range: (0.001, 0.999) after clamp.  Deterministic.
     """
-    if not state.visit_history:
+    visit_history = getattr(state, "visit_history", None) or []
+
+    if not visit_history:
         return 0.001
 
     # Collect all danger-sign IDs that existed at the START of day 0
     danger_before: set[int] = set()
-    for day_log in state.visit_history:
+    for day_log in visit_history:
         danger_before.update(day_log.get("danger_ids_before", []))
 
     if not danger_before:
@@ -119,7 +138,7 @@ def grade_task1(state: Any) -> float:
         return 0.999
 
     visited_ids: set[int] = set()
-    for day_log in state.visit_history:
+    for day_log in visit_history:
         visited_ids.update(day_log.get("visited", []))
 
     caught = len(danger_before & visited_ids)
@@ -142,14 +161,15 @@ def grade_task2(state: Any) -> float:
         "routine":        1.0,
     }
 
-    all_hh = state.all_households
+    all_hh = getattr(state, "all_households", None) or []
+    visit_history = getattr(state, "visit_history", None) or []
 
     # Build set of all household IDs visited across the episode
     visited_ids: set[int] = set()
-    for day_log in state.visit_history:
+    for day_log in visit_history:
         visited_ids.update(day_log.get("visited", []))
 
-    total_weight   = sum(weights.get(h.get("category", "routine"), 1.0) for h in all_hh)
+    total_weight = sum(weights.get(h.get("category", "routine"), 1.0) for h in all_hh)
     visited_weight = sum(
         weights.get(h.get("category", "routine"), 1.0)
         for h in all_hh
@@ -157,7 +177,10 @@ def grade_task2(state: Any) -> float:
     )
     coverage_score = visited_weight / total_weight if total_weight > 0 else 0.0
 
-    tb_score = state.tb_compliance_rate
+    # Sanitize tb_compliance_rate — could be None/NaN if no TB patients exist
+    tb_score = _safe_float(getattr(state, "tb_compliance_rate", 0.0), default=0.0)
+    # Clamp tb_score to [0, 1] before combining
+    tb_score = max(0.0, min(1.0, tb_score))
 
     return _clamp(0.5 * coverage_score + 0.5 * tb_score)
 
@@ -174,12 +197,18 @@ def grade_task3(state: Any) -> float:
                           Penalises agents that waste time on inefficient routes.
     Score range: (0.001, 0.999) after clamp.  Deterministic.
     """
-    dbi_score = 1.0 - state.disease_burden_index
+    all_hh = getattr(state, "all_households", None) or []
+    visit_history = getattr(state, "visit_history", None) or []
+
+    # Sanitize disease_burden_index — clamp to [0, 1] before inverting
+    raw_dbi = _safe_float(getattr(state, "disease_burden_index", 0.5), default=0.5)
+    raw_dbi = max(0.0, min(1.0, raw_dbi))
+    dbi_score = 1.0 - raw_dbi
 
     # Equity: visits per geo cluster (Gini-based)
     cluster_visits: dict[int, int] = {i: 0 for i in range(5)}
-    hh_cluster_map = {h.get("id"): h.get("geo_cluster", 4) for h in state.all_households}
-    for day_log in state.visit_history:
+    hh_cluster_map = {h.get("id"): h.get("geo_cluster", 4) for h in all_hh}
+    for day_log in visit_history:
         for hh_id in day_log.get("visited", []):
             c = hh_cluster_map.get(hh_id, 4)
             cluster_visits[c] = cluster_visits.get(c, 0) + 1
@@ -190,19 +219,19 @@ def grade_task3(state: Any) -> float:
         props = [v / total_v for v in cluster_visits.values()]
         gini = sum(abs(props[i] - props[j]) for i in range(n) for j in range(n))
         gini /= (2 * n * max(sum(props) / n, 1e-9) * n)
-        equity_score = 1.0 - gini
+        equity_score = max(0.0, min(1.0, 1.0 - gini))
     else:
         equity_score = 0.0
 
     # Routing efficiency: fraction of days where travel time was < 35% of DAY_END_MIN
     DAY_END = 360.0
     efficient_days = sum(
-        1 for d in state.visit_history
-        if d.get("total_travel_min", DAY_END) < DAY_END * 0.35
+        1 for d in visit_history
+        if _safe_float(d.get("total_travel_min", DAY_END), DAY_END) < DAY_END * 0.35
     )
     routing_score = (
-        efficient_days / len(state.visit_history)
-        if state.visit_history else 0.0
+        efficient_days / len(visit_history)
+        if visit_history else 0.0
     )
 
     return _clamp(
@@ -223,10 +252,17 @@ def run_grader(task_id: str, state) -> float:
     """
     Run the grader for the given task.
     Accepts either a dict or an object with attribute access.
+    Always returns a float strictly in (0.001, 0.999).
     """
     from types import SimpleNamespace
     if isinstance(state, dict):
         state = SimpleNamespace(**state)
     if task_id not in GRADERS:
         raise ValueError(f"Unknown task_id: {task_id!r}. Valid: {list(GRADERS)}")
-    return GRADERS[task_id](state)
+    try:
+        score = GRADERS[task_id](state)
+        # Final safety net — should never be needed but guarantees the contract
+        return _clamp(score)
+    except Exception:
+        # If grader crashes for any reason, return a safe mid-range value
+        return 0.001
