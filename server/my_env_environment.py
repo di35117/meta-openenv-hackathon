@@ -98,7 +98,7 @@ class MyEnvironment(_Base):
         )
         if self.task.id == "task1":
             for hh in self.village.rng.sample(list(self.village.households.values()), 8):
-                hh.risk_score = self.village.rng.uniform(0.76, 0.95)
+                hh.risk_score = self.village.rng.uniform(0.76, 0.85)
                 hh.danger_sign_active = True
         self.day       = 0
         self.history: list = []
@@ -123,7 +123,7 @@ class MyEnvironment(_Base):
         )
         if self.task.id == "task1":
             for hh in self.village.rng.sample(list(self.village.households.values()), 8):
-                hh.risk_score = self.village.rng.uniform(0.76, 0.95)
+                hh.risk_score = self.village.rng.uniform(0.76, 0.85)
                 hh.danger_sign_active = True
         self.day     = 0
         self.history = []
