@@ -131,22 +131,18 @@ def greedy_sequence(obs: dict) -> List[int]:
     selected = []
     elapsed  = 0.0
 
-    # FIX: On heavy rain days, guarantee at least 3 closest high-priority
-    # households are included regardless of time budget constraints.
-    # This prevents the agent from doing 0 visits on bad weather days.
+    # On heavy rain days, guarantee at least 3 closest high-priority households
     guaranteed = []
     if weather == "heavy_rain":
         high_pri = [
             h for h in households
             if h.get("category") in HIGH_PRIORITY or h.get("danger_sign_active")
         ]
-        # Sort by distance — closest first
         high_pri_sorted = sorted(
             high_pri, key=lambda h: h.get("dist_from_asha_home_km", 999)
         )
         guaranteed = [h["id"] for h in high_pri_sorted[:3]]
 
-    # Add guaranteed visits first
     for hid in guaranteed:
         h = next((x for x in households if x["id"] == hid), None)
         if h:
@@ -155,7 +151,6 @@ def greedy_sequence(obs: dict) -> List[int]:
             selected.append(hid)
             elapsed += t_travel + t_visit
 
-    # Fill remaining slots with normal greedy selection
     for h in ranked:
         if len(selected) >= 15:
             break
@@ -253,11 +248,9 @@ def parse_action(text: str) -> dict:
 # ── Episode runner ────────────────────────────────────────────────────────────
 
 def run_episode(task_id: str) -> dict:
-    print(f"\n{'─'*60}")
-    print(f"  TASK: {task_id.upper()}")
-    print(f"{'─'*60}")
+    # ── REQUIRED structured output: START block ───────────────────────────────
+    print(f"[START] task={task_id}", flush=True)
 
-    # Reset — unwrap observation from wrapper
     reset_raw = env_post("/reset", json={"task_id": task_id})
     obs       = reset_raw.get("observation", reset_raw)
 
@@ -266,7 +259,8 @@ def run_episode(task_id: str) -> dict:
     print(
         f"  Households: {n_hh} | Days: {max_days} | "
         f"Season: {obs.get('season')} | "
-        f"Weather: {obs.get('weather', {}).get('condition')}"
+        f"Weather: {obs.get('weather', {}).get('condition')}",
+        flush=True
     )
 
     total_reward = 0.0
@@ -275,7 +269,6 @@ def run_episode(task_id: str) -> dict:
     for step_num in range(MAX_STEPS):
         user_prompt = build_prompt(obs, task_id, step_num)
 
-        # LLM call
         action_obj = None
         try:
             completion = client.chat.completions.create(
@@ -291,34 +284,29 @@ def run_episode(task_id: str) -> dict:
             raw        = completion.choices[0].message.content or FALLBACK_ACTION
             action_obj = parse_action(raw)
         except Exception as exc:
-            print(f"  [LLM error day {step_num+1}] {exc} — using greedy fallback")
+            print(f"  [LLM error day {step_num+1}] {exc} — using greedy fallback", flush=True)
             action_obj = {"visit_sequence": greedy_sequence(obs)}
 
         visit_seq = action_obj.get("visit_sequence", [])
 
-        # Step — include task_id so server routes to correct env instance
         step_raw = env_post("/step", json={
             "action":  {"visit_sequence": visit_seq},
             "task_id": task_id,
         })
 
-        # Read done/reward from top-level response only
         reward = step_raw.get("reward", 0.0)
         done   = step_raw.get("done",   False)
-
-        # Unwrap observation for next loop iteration
-        obs  = step_raw.get("observation", step_raw)
-        meta = obs.get("metadata", {})
+        obs    = step_raw.get("observation", step_raw)
+        meta   = obs.get("metadata", {})
         total_reward += reward
 
+        # ── REQUIRED structured output: STEP block ────────────────────────────
         print(
-            f"  Day {step_num+1:>2}/{max_days}  "
-            f"visits={meta.get('visits_completed', 0):>2}  "
-            f"travel={meta.get('total_travel_min', 0):>4.0f}min  "
-            f"energy={meta.get('asha_energy_end', 100):>4.0f}%  "
-            f"deaths={meta.get('new_deaths', 0)}  "
-            f"weather={obs.get('weather', {}).get('condition', '?'):10s}  "
-            f"r={reward:+.3f}"
+            f"[STEP] step={step_num + 1} reward={reward:.4f} "
+            f"visits={meta.get('visits_completed', 0)} "
+            f"deaths={meta.get('new_deaths', 0)} "
+            f"weather={obs.get('weather', {}).get('condition', '?')}",
+            flush=True
         )
 
         if done:
@@ -345,12 +333,13 @@ def run_episode(task_id: str) -> dict:
     tb   = env_state.get("tb_compliance_rate",   0.0)
     dead = env_state.get("preventable_deaths",   0)
 
-    print(f"\n  {'─'*50}")
-    print(f"  Score          : {score:.4f}")
-    print(f"  Disease burden : {dbi:.4f}")
-    print(f"  TB compliance  : {tb:.4f}")
-    print(f"  Deaths         : {dead}")
-    print(f"  Total reward   : {total_reward:.3f}")
+    # ── REQUIRED structured output: END block ─────────────────────────────────
+    print(
+        f"[END] task={task_id} score={score:.4f} steps={step_num + 1} "
+        f"total_reward={total_reward:.3f} deaths={dead} "
+        f"disease_burden={dbi:.4f} tb_compliance={tb:.4f}",
+        flush=True
+    )
 
     return {
         "task_id":              task_id,
@@ -364,22 +353,23 @@ def run_episode(task_id: str) -> dict:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    print("=" * 60)
-    print("  ASHA Village Health — OpenEnv Baseline Inference")
-    print("=" * 60)
-    print(f"  Model   : {MODEL_NAME}")
-    print(f"  Env URL : {ENV_URL}")
-    print(f"  Tasks   : task1 (easy) -> task2 (medium) -> task3 (hard)")
+    print("=" * 60, flush=True)
+    print("  ASHA Village Health — OpenEnv Baseline Inference", flush=True)
+    print("=" * 60, flush=True)
+    print(f"  Model   : {MODEL_NAME}", flush=True)
+    print(f"  Env URL : {ENV_URL}", flush=True)
+    print(f"  Tasks   : task1 (easy) -> task2 (medium) -> task3 (hard)", flush=True)
 
     try:
         health = env_get("/health")
         print(
             f"  Env OK  : {health.get('environment', 'asha-village-health')} "
-            f"v{health.get('version', '2.0.0')}"
+            f"v{health.get('version', '2.0.0')}",
+            flush=True
         )
     except Exception as exc:
-        print(f"  [WARN] Cannot reach environment at {ENV_URL}: {exc}")
-        print("  Make sure the server is running: uvicorn server.app:app --port 8000")
+        print(f"  [WARN] Cannot reach environment at {ENV_URL}: {exc}", flush=True)
+        print("  Make sure the server is running: uvicorn server.app:app --port 8000", flush=True)
         sys.exit(1)
 
     results = []
@@ -388,7 +378,12 @@ def main():
             result = run_episode(task_id)
             results.append(result)
         except Exception as exc:
-            print(f"\n  [ERROR] Task {task_id} failed: {exc}")
+            print(f"\n  [ERROR] Task {task_id} failed: {exc}", flush=True)
+            print(
+                f"[END] task={task_id} score=0.0 steps=0 total_reward=0.0 "
+                f"deaths=-1 disease_burden=1.0 tb_compliance=0.0",
+                flush=True
+            )
             results.append({
                 "task_id":              task_id,
                 "score":                0.0,
@@ -398,22 +393,23 @@ def main():
                 "total_reward":         0.0,
             })
 
-    print(f"\n{'='*60}")
-    print("  FINAL BASELINE SCORES")
-    print(f"{'='*60}")
-    print(f"  {'Task':<8}  {'Score':>7}  {'DBI':>7}  {'TB%':>7}  {'Deaths':>7}")
-    print(f"  {'─'*8}  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*7}")
+    print(f"\n{'='*60}", flush=True)
+    print("  FINAL BASELINE SCORES", flush=True)
+    print(f"{'='*60}", flush=True)
+    print(f"  {'Task':<8}  {'Score':>7}  {'DBI':>7}  {'TB%':>7}  {'Deaths':>7}", flush=True)
+    print(f"  {'─'*8}  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*7}", flush=True)
     for r in results:
         print(
             f"  {r['task_id']:<8}  {r['score']:>7.4f}  "
             f"{r['disease_burden_index']:>7.4f}  "
             f"{r['tb_compliance_rate']:>7.4f}  "
-            f"{r['preventable_deaths']:>7}"
+            f"{r['preventable_deaths']:>7}",
+            flush=True
         )
 
     avg = sum(r["score"] for r in results) / max(len(results), 1)
-    print(f"\n  Average score: {avg:.4f}")
-    print(f"{'='*60}")
+    print(f"\n  Average score: {avg:.4f}", flush=True)
+    print(f"{'='*60}", flush=True)
 
 
 if __name__ == "__main__":
