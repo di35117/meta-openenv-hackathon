@@ -27,7 +27,7 @@ from openai import OpenAI
 
 API_BASE_URL = os.environ.get("API_BASE_URL", "<your-active-model-api-url>")
 MODEL_NAME   = os.environ.get("MODEL_NAME",   "<your-active-model>")
-HF_TOKEN     = os.environ.get("HF_TOKEN")
+HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
 ENV_URL      = os.environ.get("ENV_URL",      "http://localhost:8000")
 
 BENCHMARK       = "asha-village-health"
