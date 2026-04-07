@@ -2,7 +2,7 @@
 # Standalone Dockerfile that does NOT depend on the private openenv-base image.
 # Works on Hugging Face Spaces (Docker SDK) and any standard Docker host.
 
-FROM python:3.11.9-slim-bullseye
+FROM public.ecr.aws/docker/library/python:3.11-slim
 
 # HF Spaces runs as a non-root user with UID 1000
 RUN useradd -m -u 1000 user
