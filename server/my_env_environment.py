@@ -1,45 +1,34 @@
 """
 my_env_environment.py — The RL environment.  Implements the OpenEnv interface.
 
-What changed from the static version:
+REWARD FUNCTION IMPROVEMENTS (this revision):
+  1. Missed danger sign penalty: -0.15 per known danger sign left unvisited.
+     Previously the agent only paid -1.0 when a death occurred (days later).
+     This gives immediate signal to not skip critical cases.
 
-TIME TRACKING
-  A 6-hour clock runs each day (7:00 AM → 1:00 PM = 0 → 360 minutes).
-  Every travel hop costs real minutes (distance / weather-adjusted speed).
-  Every visit costs real minutes (base + danger-sign extra + referral prep).
-  The loop stops when the clock reaches 360, not when a visit count is hit.
-  This means: far households cost the ASHA more time than close ones,
-  rainy days shrink the effective visit window, and batching nearby households
-  frees up time for more visits.
+  2. Near-death proactive penalty: -0.20 per household with risk >= 0.90
+     that was NOT visited.  This fires the day BEFORE death, giving the agent
+     a chance to course-correct without waiting for the terminal -1.0.
 
-ASHA POSITION TRACKING
-  The ASHA starts at home (5, 5) each morning.
-  Her position updates after each travel hop.
-  Travel time to the next household is computed FROM her current position,
-  not from home — so route order genuinely matters.
+  3. Scaled newborn reward: day-0 birth = +0.40, day-1 = +0.30, day-2 = +0.20.
+     Previously flat +0.25 regardless of urgency.  The 48-hour window is real:
+     neonatal sepsis mortality doubles every 12 hours of delay.
 
-ASHA ENERGY / FATIGUE
-  Energy starts at 100 each morning.
-  Walking costs 0.15 energy per minute.
-  Visits cost 0.10 energy per minute.
-  Below 60% energy → visits take longer and reset risk less effectively.
-  Below 30% energy → significant quality degradation.
-  Energy resets to 100 at the start of each new day.
+  4. TB overdue penalty: if a TB patient is visited but already past their
+     3-day window, apply a small penalty (-0.03 per day late, capped at -0.10).
+     Previously only rewarded on-time doses, never penalized late ones.
 
-SEASONAL / WEATHER DYNAMICS
-  season and weather update at the end of every step.
-  Deterioration rates on tick() include the seasonal multiplier.
-  Alert rates in generate_daily_events() scale with season.
-  Road quality presented to the agent already has weather modifier applied.
+  5. Scaled geographic equity bonus: +0.01 per cluster covered beyond 1,
+     up to +0.05 (previously flat 0 or +0.03 at exactly 3 clusters).
 
-REWARD FUNCTION (fixed vs original):
-  1. Removed hard clip max(-1, min(1, r)) — replaced with tanh normalisation
-     so the agent can distinguish catching 3 danger signs vs 6.
-  2. Time efficiency bonus was BACKWARDS (rewarded doing nothing).
-     Replaced with a visits-per-hour throughput bonus.
-  3. Referral bonus no longer double-counts with danger_sign.
-  4. Routing efficiency is now continuous, not a binary threshold.
-  5. Added geographic equity bonus for visiting 3+ clusters per day.
+  6. Near-critical TB penalty: if a TB patient has been missed for 5+ days
+     (drug-resistance window), apply -0.08 per such patient not visited.
+
+UNCHANGED FROM PREVIOUS VERSION:
+  - Time tracking, ASHA position, energy model
+  - tanh normalisation (no hard clip)
+  - Throughput bonus, routing efficiency bonus
+  - Death penalty (-1.0 per death, floored at -1.0 with tanh)
 """
 
 import math
@@ -72,8 +61,8 @@ MAX_VISITS     = 15    # absolute cap even if time allows
 
 # ── ASHA energy model ─────────────────────────────────────────────────────────
 ENERGY_START               = 100.0
-ENERGY_COST_TRAVEL_PER_MIN = 0.15   # walking is physically taxing
-ENERGY_COST_VISIT_PER_MIN  = 0.10   # mental + clinical effort per minute
+ENERGY_COST_TRAVEL_PER_MIN = 0.15
+ENERGY_COST_VISIT_PER_MIN  = 0.10
 
 
 class MyEnvironment(_Base):
@@ -96,10 +85,7 @@ class MyEnvironment(_Base):
             season=self.task.season,
             start_day_of_year=self.task.start_day_of_year,
         )
-        if self.task.id == "task1":
-            for hh in self.village.rng.sample(list(self.village.households.values()), 8):
-                hh.risk_score = self.village.rng.uniform(0.76, 0.85)
-                hh.danger_sign_active = True
+        self._seed_task1_dangers()
         self.day       = 0
         self.history: list = []
         self._current_alerts: list = []
@@ -121,45 +107,66 @@ class MyEnvironment(_Base):
             season=self.task.season,
             start_day_of_year=self.task.start_day_of_year,
         )
-        if self.task.id == "task1":
-            for hh in self.village.rng.sample(list(self.village.households.values()), 8):
-                hh.risk_score = self.village.rng.uniform(0.76, 0.85)
-                hh.danger_sign_active = True
+        self._seed_task1_dangers()
         self.day     = 0
         self.history = []
         self._current_alerts = []
         self._reset_daily_asha()
         return self._make_observation(reward=0.0, done=False, info={})
 
+    def _seed_task1_dangers(self):
+        """
+        For task1: guarantee exactly 8 danger-sign households.
+        Uses a secondary RNG seeded from the task seed so it is always
+        deterministic but doesn't disturb the village-generation sequence.
+        """
+        if self.task.id != "task1":
+            return
+        import random
+        seed_rng = random.Random(self.task.seed + 999)
+        candidates = [
+            hh for hh in self.village.households.values()
+            if not hh.is_dead
+        ]
+        for hh in seed_rng.sample(candidates, min(8, len(candidates))):
+            hh.risk_score = seed_rng.uniform(0.76, 0.88)
+            hh.danger_sign_active = True
+
     def step(self, action: Action) -> Observation:
         """
         Execute one day of ASHA work.
 
-        The route is simulated minute-by-minute:
+        Route simulation:
           for each household in visit_sequence:
             1. compute travel time from current position to household
-            2. check if time + visit will fit within the day
-            3. move ASHA to household (time + energy consumed)
-            4. execute visit (time + energy consumed; result depends on energy)
-            5. update ASHA position
+            2. check if travel + visit fits in the day
+            3. travel (time + energy consumed)
+            4. visit (time + energy consumed; effectiveness depends on energy)
+            5. update position
           tick() all unvisited households
-          generate_daily_events()
+          generate daily events
           compute reward
-          update season + weather for next day
+          update season + weather
           reset ASHA for tomorrow
         """
         self._state.step_count += 1
 
-        # Snapshot which households had danger signs BEFORE any visit
-        # (visiting clears the flag — grader needs the pre-visit truth)
-        danger_ids_before = {
+        # Snapshot danger signs BEFORE any visit (grader needs pre-visit truth)
+        danger_ids_before: set = {
             hh.id for hh in self.village.households.values()
             if hh.danger_sign_active
         }
 
+        # Snapshot near-death households BEFORE visiting
+        # (risk >= 0.90 but not yet dead — proactive signal)
+        near_death_before: set = {
+            hh.id for hh in self.village.households.values()
+            if hh.risk_score >= 0.90 and not hh.is_dead
+        }
+
         # ── Execute route ─────────────────────────────────────────────────
         visit_results: list = []
-        cx, cy = self.asha_x, self.asha_y    # ASHA current position
+        cx, cy = self.asha_x, self.asha_y
         elapsed_min  = self.current_time_min
         energy       = self.asha_energy
 
@@ -170,39 +177,32 @@ class MyEnvironment(_Base):
             if hh.is_dead:
                 continue
 
-            # ① Real travel time from CURRENT POSITION to this household
             road_q     = self.village.effective_road_quality(hh_id)
             travel_min = travel_time_minutes(
                 cx, cy, hh.x, hh.y, road_q, self.village.weather.condition
             )
 
-            # ② Check if travel + estimated visit fits in the day
             est_visit  = hh.est_visit_duration_min()
             if elapsed_min + travel_min + est_visit > DAY_END_MIN:
-                # No time — stop routing for today
                 break
 
-            # ③ ASHA travels to household (uses time + energy)
             elapsed_min += travel_min
             energy       = max(0.0, energy - travel_min * ENERGY_COST_TRAVEL_PER_MIN)
 
-            # ④ Execute visit (actual duration may differ from estimate)
             result = hh.receive_visit(energy_pct=energy)
             actual_visit_min = result["visit_duration_min"]
             elapsed_min += actual_visit_min
             energy       = max(0.0, energy - actual_visit_min * ENERGY_COST_VISIT_PER_MIN)
 
-            # ⑤ Update ASHA position to this household
             cx, cy = hh.x, hh.y
 
-            # Annotate result with routing data (useful for debugging + history)
             result["household_id"]    = hh_id
             result["travel_min"]      = round(travel_min, 1)
             result["time_of_visit"]   = round(elapsed_min, 1)
             result["energy_at_visit"] = round(energy, 1)
             visit_results.append(result)
 
-        # Save ASHA's end-of-day state
+        # Save ASHA end-of-day state
         self.asha_x           = cx
         self.asha_y           = cy
         self.asha_energy      = round(energy, 1)
@@ -222,7 +222,13 @@ class MyEnvironment(_Base):
 
         # ── Compute reward ────────────────────────────────────────────────
         reward = self._compute_reward(
-            visit_results, new_deaths, total_travel_min, elapsed_min
+            visit_results=visit_results,
+            new_deaths=new_deaths,
+            total_travel_min=total_travel_min,
+            elapsed_min=elapsed_min,
+            danger_ids_before=danger_ids_before,
+            near_death_before=near_death_before,
+            visited_ids=visited_ids,
         )
 
         # ── Log this day ──────────────────────────────────────────────────
@@ -243,7 +249,6 @@ class MyEnvironment(_Base):
         self.day += 1
         done = self.day >= self.task.max_days
 
-        # Reset ASHA for next morning
         self._reset_daily_asha()
 
         return self._make_observation(
@@ -272,108 +277,143 @@ class MyEnvironment(_Base):
         new_deaths: int,
         total_travel_min: float,
         elapsed_min: float,
+        danger_ids_before: set,
+        near_death_before: set,
+        visited_ids: set,
     ) -> float:
         """
-        Compute a shaped per-step reward grounded in real ASHA clinical priorities.
+        Shaped per-step reward grounded in real ASHA clinical priorities.
 
-        Fixes over the original version
-        ────────────────────────────────
-        1. No hard clip: original max(-1, min(1, r)) destroyed the learning signal
-           on almost every realistic day.  A good day (3 danger signs + 2 newborns
-           + 3 TB doses) had raw reward ~3.2, clipped to 1.0 — identical to a
-           mediocre day with 1 danger sign.  Fixed with tanh normalisation, which
-           preserves ordering while gently saturating at extremes.
+        Positive signals (per visit):
+          +0.40        danger sign caught
+          +0.20        referral needed (non-danger high-risk case)
+          +0.40/0.30/0.20  newborn visited at day 0/1/2 of life
+          +0.15        TB dose supervised on time
+          +0.05        high-risk pregnancy or diabetic visited
+          +0.00–0.05   throughput bonus (visits per hour)
+          +0.00–0.04   routing efficiency bonus (low travel fraction)
+          +0.01–0.05   geographic equity (clusters covered beyond first)
 
-        2. Time efficiency bonus was backwards: original formula
-           (time_remaining / 360) * 0.04 gave the HIGHEST bonus (0.04) for
-           completing zero visits.  Fixed: now rewards visits-per-hour throughput
-           so doing more work in less time is always better.
+        Negative signals:
+          -0.05 × scaled  wasted visit (stable routine household)
+          -0.15           per known danger sign left unvisited (immediate)
+          -0.20           per near-death household (risk ≥ 0.90) left unvisited
+          -0.03/day late  TB patient visited but already overdue (max -0.10)
+          -0.08           per TB patient with 5+ days missed (drug-resistance)
+          -1.00 × deaths  preventable death (dominates all clinical gains)
 
-        3. Referral no longer double-counts danger signs: when danger_sign is
-           active, risk_score > 0.75 is always true, so the original fired both
-           +0.40 (danger) and +0.30 (referral).  Referral bonus now only fires
-           for non-danger high-risk cases.
-
-        4. Routing efficiency is continuous: original was a binary step
-           (travel < 108 min → +0.03, else 0).  Now scales smoothly.
-
-        5. Geographic equity bonus: small reward for visiting 3+ geo clusters,
-           discouraging the agent from only optimising the nearest cluster.
+        All pre-penalty values are summed then passed through tanh(r/4.0)
+        so the agent can distinguish a good day from a great day without
+        extreme reward magnitudes.
         """
         r = 0.0
 
         for res in visit_results:
             cat = res["category"]
 
-            # ── Core clinical rewards ─────────────────────────────────────
-            # Danger sign caught: highest-value ASHA action in real practice.
+            # ── Danger sign caught ────────────────────────────────────────
             if res["danger_sign"]:
                 r += 0.40
 
-            # Referral bonus: fires only for non-danger high-risk cases to
-            # avoid double-counting (danger_sign always implies risk > 0.75).
+            # ── Referral (non-danger high-risk) ───────────────────────────
+            # Fires only when danger_sign is NOT active to avoid double-count.
             if res["referral_needed"] and not res["danger_sign"]:
                 r += 0.20
 
-            # 48-hour newborn visit: prevents neonatal sepsis — time-critical.
+            # ── Newborn: scaled by urgency ────────────────────────────────
+            # Day-0 birth has same severity as a caught danger sign.
+            # Neonatal sepsis mortality approximately doubles every 12h of delay.
             if res.get("newborn_48hr"):
-                r += 0.25
+                dsb = res.get("days_since_birth") or 0
+                if dsb == 0:
+                    r += 0.40   # same-day birth — maximum urgency
+                elif dsb == 1:
+                    r += 0.30
+                else:
+                    r += 0.20   # day 2 — still within window but less acute
 
-            # TB dose supervised on time: prevents drug-resistant TB.
+            # ── TB dose supervised on time ────────────────────────────────
             if res.get("tb_dose_on_time"):
                 r += 0.15
+            elif cat == "tb_patient":
+                # TB patient visited but already past the 3-day window.
+                # Late is still better than never, but apply a small penalty.
+                days_late = max(0, res.get("days_since_visit", 0) - 3)
+                r -= min(0.10, days_late * 0.03)
 
-            # High-priority category visited (even if currently stable).
+            # ── High-priority category (stable but needs monitoring) ───────
             if cat in ("high_risk_preg", "diabetic"):
                 r += 0.05
 
-            # Wasted-visit penalty: routine household that genuinely didn't
-            # need attention.  Scaled so lower-risk = bigger penalty.
+            # ── Wasted visit: stable routine household ────────────────────
+            # Penalty scales with how low the risk is — the lower the risk,
+            # the more wasteful visiting is relative to skipping a critical HH.
             if cat == "routine" and not res["danger_sign"] and res["risk_before"] < 0.10:
                 waste_penalty = 0.05 * (1.0 - res["risk_before"] / 0.10)
                 r -= waste_penalty
 
+        # ── Missed danger sign penalty ────────────────────────────────────
+        # Fires immediately when a known danger sign is not visited today.
+        # This is the most important new signal: the agent cannot rationally
+        # skip a danger sign and wait for the deferred -1.0 death penalty.
+        missed_dangers = danger_ids_before - visited_ids
+        r -= 0.15 * len(missed_dangers)
+
+        # ── Near-death proactive penalty ──────────────────────────────────
+        # Households at risk >= 0.90 are one bad tick away from dying.
+        # Penalize leaving them unvisited to teach the agent to act before
+        # the terminal -1.0 death penalty fires.
+        near_death_missed = near_death_before - visited_ids
+        r -= 0.20 * len(near_death_missed)
+
+        # ── TB drug-resistance penalty ────────────────────────────────────
+        # TB patients unvisited for 5+ days begin developing drug resistance.
+        # This fires even if they don't die, because resistance is irreversible.
+        for hh in self.village.households.values():
+            if (hh.category == "tb_patient"
+                    and hh.id not in visited_ids
+                    and hh.days_since_visit >= 5
+                    and not hh.is_dead):
+                r -= 0.08
+
         # ── Throughput bonus ──────────────────────────────────────────────
-        # Reward visits-per-hour: more effective visits in less total time
-        # means better geographic batching.
+        # Rewards doing more effective visits per hour of working time.
         # Max practical throughput ≈ 10 visits / 360 min = 1.67 visits/hr.
-        # Bonus is capped at +0.05 to keep it smaller than clinical rewards.
+        # Capped at +0.05 to stay smaller than clinical rewards.
         if elapsed_min > 0:
             visits_per_hour  = (len(visit_results) / elapsed_min) * 60.0
             throughput_bonus = min(0.05, (visits_per_hour / 1.67) * 0.05)
             r += throughput_bonus
 
         # ── Routing efficiency bonus (continuous) ─────────────────────────
-        # Original: binary if travel_min < 108 → +0.03.
-        # Fixed: scales from 0 (travel = 100% of elapsed) to 0.04
-        # (travel = 0% of elapsed).  Rewards cluster batching proportionally.
+        # Scales from 0 (all time spent walking) to +0.04 (minimal travel).
+        # Rewards cluster batching without binary thresholds.
         if len(visit_results) > 0 and elapsed_min > 0:
             travel_fraction = total_travel_min / elapsed_min
             routing_bonus   = max(0.0, (0.50 - travel_fraction) / 0.50) * 0.04
             r += routing_bonus
 
-        # ── Geographic equity bonus ───────────────────────────────────────
-        # Small reward for reaching at least 3 distinct geographic clusters.
-        # Prevents the agent from exploiting only the nearest cluster and
-        # mirrors how real ASHA supervisors track equitable coverage.
-        visited_clusters = set()
+        # ── Geographic equity bonus (scaled) ─────────────────────────────
+        # +0.01 per cluster covered beyond the first, up to +0.05.
+        # Prevents the agent from permanently camping in the nearest cluster.
+        visited_clusters: set = set()
         for res in visit_results:
             hh_id = res.get("household_id")
             if hh_id is not None and hh_id in self.village.households:
                 visited_clusters.add(self.village.households[hh_id].geo_cluster)
-        if len(visited_clusters) >= 3:
-            r += 0.03
+        n_clusters = len(visited_clusters)
+        if n_clusters >= 2:
+            equity_bonus = min(0.05, (n_clusters - 1) * 0.01)
+            r += equity_bonus
 
-        # ── Death penalty ─────────────────────────────────────────────────
-        # A preventable death cannot be undone.  -1.0 per death is
-        # calibrated to overwhelm any single-day clinical gain, ensuring
-        # the agent never rationally trades a death for more reward.
+        # ── Death penalty + tanh normalisation ───────────────────────────
+        # -1.0 per death overwhelms any single-day clinical gain.
+        # tanh(r/4.0) preserves the ordering of good vs great days while
+        # bounding the output to (-1, 1).
         r -= 1.0 * new_deaths
         if new_deaths == 0:
             normalized = math.tanh(r / 4.0)
         else:
-            # Death occurred: apply tanh but floor at -1.0 so multiple
-            # simultaneous deaths stay distinguishable.
             normalized = max(-1.0, math.tanh(r / 4.0))
 
         return round(normalized, 4)
@@ -381,11 +421,6 @@ class MyEnvironment(_Base):
     # ── Full grading state ────────────────────────────────────────────────────
 
     def get_full_state(self) -> dict:
-        """
-        Returns the complete simulation state as a plain dict.
-        Used by the /state and /grade HTTP endpoints.
-        The grader functions receive a SimpleNamespace of this dict.
-        """
         return {
             "task_id":              self.task.id,
             "current_day":          self.day,
@@ -413,23 +448,12 @@ class MyEnvironment(_Base):
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _reset_daily_asha(self):
-        """Reset ASHA's position and energy to start-of-day values."""
         self.asha_x           = self.village.asha_home_x
         self.asha_y           = self.village.asha_home_y
         self.asha_energy      = ENERGY_START
         self.current_time_min = DAY_START_MIN
 
     def _make_observation(self, reward: float, done: bool, info: dict) -> Observation:
-        """
-        Convert internal simulation state into a typed Observation.
-
-        For each household, the agent sees:
-          - Health state (risk, category, danger, days since visit)
-          - Real coordinates (x, y) for route planning
-          - Road quality AFTER today's weather modifier is applied
-          - Straight-line distance from ASHA's home
-          - Estimated visit duration (before entering)
-        """
         hh_states = []
         for hh in self.village.households.values():
             road_q = self.village.effective_road_quality(hh.id)
